@@ -1,0 +1,31 @@
+# Secrets
+.env
+*.env
+config/secrets/
+
+# API keys / credentials
+**/groq-api-key
+**/*.key
+**/*.pem
+
+# Runtime / state (created by voxtype at runtime)
+.runtime/
+*.sock
+*.pid
+state
+
+# Downloaded model weights (large; obtained via install.sh)
+models/
+*.bin
+*.gguf
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/

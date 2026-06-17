@@ -1,0 +1,37 @@
+#!/bin/sh
+# voxtype-paste-active: paste the just-copied dictation into the focused window.
+#
+# Designed as the `post_output_command` for VoxType. VoxType has already
+# copied the cleaned text to the X11 clipboard via xclip; this hook just
+# fires Ctrl+V (or Ctrl+Shift+V in a terminal so the shell receives a
+# paste event instead of treating ^V as literal-input).
+#
+# Detection is intentionally lightweight (lower-cased class + WM_CLASS +
+# window name substring match). Add more terminals to the case list if
+# yours is missing.
+
+set -eu
+
+sleep 0.05
+
+window_id="$(xdotool getactivewindow 2>/dev/null || true)"
+window_class=""
+wm_class=""
+window_name=""
+
+if [ -n "$window_id" ]; then
+  window_class="$(xdotool getwindowclassname "$window_id" 2>/dev/null || true)"
+  wm_class="$(xprop -id "$window_id" WM_CLASS 2>/dev/null || true)"
+  window_name="$(xdotool getwindowname "$window_id" 2>/dev/null || true)"
+fi
+
+target="$(printf '%s %s %s' "$window_class" "$wm_class" "$window_name" | tr '[:upper:]' '[:lower:]')"
+
+case "$target" in
+  *terminal*|*console*|*ptyxis*|*kgx*|*konsole*|*tilix*|*kitty*|*alacritty*|*wezterm*|*ghostty*)
+    xdotool key --clearmodifiers ctrl+shift+v
+    ;;
+  *)
+    xdotool key --clearmodifiers ctrl+v
+    ;;
+esac

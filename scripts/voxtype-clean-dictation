@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+voxtype-clean-dictation: pipe stdin through Groq LLM for grammar cleanup.
+
+Designed as the `[output.post_process].command` for VoxType. Receives
+transcribed text on stdin and emits cleaned text on stdout.
+
+Behavior:
+- Short snippets (<90 chars / <14 words) pass through unchanged.
+- Likely shell/code lines pass through unchanged.
+- Otherwise, the text is sent to a Groq chat-completions call and the
+  first choice is emitted.
+- On any failure (timeout, HTTP error, parse error, oversized output),
+  the original text is emitted unchanged so the daemon never blocks.
+
+Auth:
+- Reads GROQ_API_KEY from env, or from ~/.config/voxtype/groq-api-key
+  if it exists.
+
+Overrides (env):
+- GROQ_MODEL     default: qwen/qwen3.6-27b
+- GROQ_ENDPOINT  default: https://api.groq.com/openai/v1/chat/completions
+"""
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import urllib.error
+import urllib.request
+
+
+MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
+ENDPOINT = os.environ.get(
+    "GROQ_ENDPOINT", "https://api.groq.com/openai/v1/chat/completions"
+)
+KEY_FILE = Path.home() / ".config" / "voxtype" / "groq-api-key"
+
+
+def should_skip(text: str) -> bool:
+    words = re.findall(r"\S+", text)
+    if len(text) < 90 and len(words) < 14:
+        return True
+
+    # Avoid rewriting likely shell/code snippets.
+    code_markers = ["&&", "||", "sudo ", "git ", "docker ", "systemctl ", "journalctl ", "~/", "./", "--"]
+    lowered = text.lower()
+    if any(marker in lowered for marker in code_markers):
+        return True
+
+    return False
+
+
+def clean(text: str) -> str:
+    system = (
+        "Sen deneyimli bir Türkçe/İngilizce editörüsün. "
+        "ASR/dikte çıktısını doğal, kısa ve dilbilgisel olarak düzgün metne çevirirsin. "
+        "Kelime kelime sadık kalmazsın; konuşmacının niyetini korursun. "
+        "Bozuk ASR parçalarını düzeltir veya atarsın. Çeviri yapmazsın. "
+        "Teknik terimleri, komutları, dosya yollarını ve kod isimlerini değiştirme. "
+        "Sadece son metni yazarsın."
+    )
+    user = f"""Kurallar:
+- Düzgün, doğal ve okunabilir yaz.
+- Metnin dilini koru: Türkçe parçalar Türkçe, English parts stay in English.
+- "çalışıyor değil" gibi ifadeleri "çalışmıyor" gibi doğal hale getir.
+- "emin miyseniz emin miyiz çalışıyor mu diye" gibi bozuk parçaları "çalışıp çalışmadığından emin değilim" gibi doğal hale getir.
+- "letmiyordur" gibi anlamsız ASR kelimelerini bağlama göre düzelt.
+- Gereksiz tekrarları ve dolgu ifadelerini sil.
+- Yeni bilgi ekleme; belirsiz yerde en olası anlamı seç.
+
+METİN:
+{text}"""
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key and KEY_FILE.exists():
+        api_key = KEY_FILE.read_text(encoding="utf-8").strip()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.0,
+        "max_completion_tokens": 256,
+    }
+
+    if MODEL.startswith("openai/gpt-oss"):
+        payload.update({"include_reasoning": False, "reasoning_effort": "low"})
+    elif MODEL.startswith("qwen/"):
+        payload["reasoning_effort"] = "none"
+
+    req = urllib.request.Request(
+        ENDPOINT,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "voxtype-dictation-cleaner/1.0",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=3.5) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    choices = data.get("choices") or []
+    output = choices[0].get("message", {}).get("content", "").strip() if choices else ""
+    output = output.strip('"').strip()
+    return output
+
+
+def main() -> int:
+    original = sys.stdin.read()
+    text = original.strip()
+
+    if not text or should_skip(text):
+        sys.stdout.write(original)
+        return 0
+
+    try:
+        output = clean(text)
+    except (TimeoutError, RuntimeError, urllib.error.URLError, json.JSONDecodeError, OSError):
+        sys.stdout.write(original)
+        return 0
+
+    if not output:
+        sys.stdout.write(original)
+        return 0
+
+    # If the model ignored the instruction and expanded heavily, prefer safety.
+    if len(output) > max(len(text) * 1.5, len(text) + 120):
+        sys.stdout.write(original)
+        return 0
+
+    sys.stdout.write(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
