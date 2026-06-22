@@ -40,7 +40,7 @@ Notifications are fire-and-forget (failures silently ignored).
 - `scripts/voxtype-rephrase` — reads PRIMARY/CLIPBOARD selection via xclip, rewrites via Groq, pastes via `xdotool key ctrl+v` (or `ctrl+shift+v` in terminals). Captures active window ID inside `paste_text()` (not from `main()`) — re-reads just before paste to avoid window-switch races.
 - `scripts/voxtype-summarize` — reads PRIMARY/CLIPBOARD selection via xclip, summarizes via Groq (temp 0.15, no reasoning), shows GTK3 popup near mouse cursor. Auto-closes after 30s or on click/Escape/q.
 - `scripts/voxtype-tray` — system tray indicator (GTK3 StatusIcon / Ayatana AppIndicator3). Right-click menu includes "Calibrate Microphone" which runs `voxtype-calibrate-mic`.
-- `scripts/voxtype-calibrate-mic` — interactive mic gain calibration. Records noise + speech samples at increasing gain levels, finds the highest non-clipping level, sets it via amixer. Run with `./install.sh --calibrate-mic` or from the tray menu.
+- `scripts/voxtype-calibrate-mic` — interactive mic gain calibration. Records noise + speech samples at increasing gain levels, targets safe speech headroom instead of the loudest possible gain, and sets it via amixer. Run with `./install.sh --calibrate-mic` or from the tray menu.
 - `scripts/voxtype-paste-active` — shell script, X11-only (xdotool + xprop).
 - All Python scripts use **stdlib only** (no pip dependencies). Require **Python 3.11+** (`tomllib`).
 - Model-specific payload fields: if model starts with `openai/gpt-oss`, payload uses `reasoning_effort: "low"`. If starts with `qwen/`, uses `reasoning_effort: "none"`. See `voxtype-clean-dictation:129-132`.
@@ -79,7 +79,7 @@ User must be in `input` group (hotkey evdev + modifier-release guard). Takes eff
 make lint   # bash -n + py_compile + sh -n sweep
 ```
 
-No CI, no test files.
+Release workflow: `.github/workflows/release.yml` runs `make lint` on `v*` tags, builds a source tarball, writes `SHA256SUMS`, and uploads both to the GitHub release. No test files.
 
 ## Documentation
 

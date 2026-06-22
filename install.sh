@@ -386,6 +386,11 @@ verify() {
   else
     err "script:   $SCRIPT_DST_DIR/voxtype-tray MISSING"; fail=1
   fi
+  if [[ -x "$SCRIPT_DST_DIR/voxtype-calibrate-mic" ]]; then
+    ok "script:   $SCRIPT_DST_DIR/voxtype-calibrate-mic"
+  else
+    err "script:   $SCRIPT_DST_DIR/voxtype-calibrate-mic MISSING"; fail=1
+  fi
 
   if [[ -f "$VOXTYPE_CONFIG_DST" ]]; then
     ok "config:   $VOXTYPE_CONFIG_DST"
@@ -474,6 +479,7 @@ do_uninstall() {
   rm -f  "$SCRIPT_DST_DIR/voxtype-rephrase"
   rm -f  "$SCRIPT_DST_DIR/voxtype-summarize"
   rm -f  "$SCRIPT_DST_DIR/voxtype-tray"
+  rm -f  "$SCRIPT_DST_DIR/voxtype-calibrate-mic"
   rm -f  "$HOME/.xbindkeysrc"
   rm -f  "$SYSTEMD_DST_DIR/xbindkeys.service"
 

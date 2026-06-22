@@ -4,10 +4,17 @@
 
 # smart-dictate
 
-Reproducible bootstrap for a local push-to-talk voice-to-text pipeline with
-LLM text rephrasing on Ubuntu 24.04:
+<p align="center">
+  <a href="https://github.com/oguzkaganozt/auto-speech/actions/workflows/release.yml"><img alt="Release" src="https://github.com/oguzkaganozt/auto-speech/actions/workflows/release.yml/badge.svg"></a>
+  <img alt="Ubuntu 24.04" src="https://img.shields.io/badge/Ubuntu-24.04-E95420?logo=ubuntu&logoColor=white">
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green.svg">
+</p>
 
-```
+Push-to-talk dictation for Ubuntu 24.04: VoxType + Whisper large-v3-turbo +
+Groq cleanup + terminal-aware paste.
+
+```text
 mic  ──►  VoxType daemon  ──►  OpenAI Whisper (large-v3-turbo, Vulkan/NVIDIA)
                                   │
                                   ▼
@@ -17,107 +24,126 @@ mic  ──►  VoxType daemon  ──►  OpenAI Whisper (large-v3-turbo, Vulka
                           xdotool auto-paste
 ```
 
-The transcription runs entirely on your machine; only the cleanup step (a
-small, latency-bounded Groq call) touches the network. Output is auto-pasted
-into the focused window with terminal-aware shortcuts.
+Transcription runs locally. Only the optional cleanup/rephrase/summarize steps
+call Groq. Output is copied to the clipboard and pasted into the focused window
+with `Ctrl+V`, or `Ctrl+Shift+V` for terminals.
 
-Select any text and press Super+R to rephrase it in-place via the same Groq
-LLM — a separate shortcut for text refinement without leaving your keyboard.
+## Features
+
+- Toggle dictation with the configured hotkey, default `RIGHTCTRL`.
+- Local Whisper transcription with Vulkan/NVIDIA acceleration.
+- Groq LLM cleanup for natural dictation while preserving shell/code snippets.
+- Selection rephrase with `Ctrl+Alt+R`.
+- Selection summarize with `Ctrl+Alt+S` and a small GTK popup.
+- System tray controls for start/stop/restart and microphone calibration.
+- Terminal-aware paste for Kitty, Alacritty, Ghostty, WezTerm, Konsole, Ptyxis,
+  KGX, Tilix, and common terminal windows.
 
 ## Quickstart
 
 ```bash
-git clone <this-repo> smart-dictate
+git clone https://github.com/oguzkaganozt/auto-speech.git smart-dictate
 cd smart-dictate
 
-# 1. Put your Groq API key somewhere (choose one):
+# Choose one API key path:
 export GROQ_API_KEY="gsk_..."
 # or:
-cp .env.example .env && $EDITOR .env
+cp .env.example .env && "$EDITOR" .env
 
-# 2. Install (idempotent: safe to re-run)
 ./install.sh
-
-# 3. Log out / back in (so the `input` group change takes effect),
-#    then press RIGHT CTRL to toggle recording.
 ```
 
-`install.sh` will:
-- install VoxType v0.7.5 (.deb) and its recommended runtime deps
-- ensure your user is in the `input` group (for hotkey + modifier-release)
-- drop the config + systemd unit + Vulkan drop-in into `~/.config/`
-- install `voxtype-clean-dictation`, `voxtype-paste-active`, and `voxtype-rephrase` into `~/.local/bin/`
-- download the `large-v3-turbo` Whisper model into `~/.local/share/voxtype/models/`
-- enable and start the user service
+Log out and back in after the first install so the `input` group membership is
+active. Then press `RIGHTCTRL`, speak, and press `RIGHTCTRL` again to paste the
+cleaned text into the current window.
+
+## Commands
+
+```bash
+make install          # run ./install.sh
+make check            # verify installed files/services
+make status           # show voxtype service status and recent logs
+make lint             # syntax-check shell and Python scripts
+make uninstall        # remove services, scripts, config, and model data
+```
+
+Installer flags:
+
+- `./install.sh --yes` runs non-interactively.
+- `./install.sh --check` verifies without changing files.
+- `./install.sh --dry-run` prints planned actions.
+- `./install.sh --uninstall` removes the installation.
+- `KEEP_CONFIG=1 make uninstall` preserves user config.
+- `KEEP_MODEL=1 make uninstall` preserves the Whisper model.
+
+## Configuration
+
+Runtime config lives in:
+
+- `~/.config/voxtype/config.toml`
+- `~/.config/smart-dictate/config.toml`
+- `~/.xbindkeysrc`
+
+Source templates live under `config/`. Re-run `./install.sh` after editing repo
+templates.
+
+Groq API key lookup order:
+
+1. `GROQ_API_KEY` environment variable
+2. `~/.config/smart-dictate/config.toml`
+3. `~/.config/voxtype/groq-api-key`
+4. Interactive installer prompt
+
+See [docs/configuration.md](docs/configuration.md) for all knobs.
 
 ## Verify
 
 ```bash
-voxtype setup check                # system check
-systemctl --user status voxtype    # daemon should be active
-voxtype status                     # should print state (idle/recording/...)
-
-# Hold RIGHT CTRL, speak Turkish or English for a few seconds, release.
-# The cleaned text should appear in the focused window via Ctrl+V (or
-# Ctrl+Shift+V if it's a terminal).
+voxtype setup check
+systemctl --user status voxtype
+journalctl --user -u voxtype.service -n 30 --no-pager
+journalctl --user -u voxtype-tray.service -n 10 --no-pager
+voxtype status
 ```
 
-## Repository layout
+If transcription works but text does not paste, check the active window type and
+`scripts/voxtype-paste-active` terminal detection.
 
-```
+## Repository
+
+```text
 smart-dictate/
-├── README.md                       # this file
-├── LICENSE                         # MIT
-├── install.sh                      # one-shot bootstrap
-├── install.sh --uninstall          # reverse of install
-├── Makefile                        # make install / uninstall / status / check
-├── .env.example                    # GROQ_API_KEY template
-├── config/
-│   ├── voxtype.toml                # ~/.config/voxtype/config.toml
-│   └── systemd/
-│       ├── voxtype.service         # user-level systemd unit
-│       └── voxtype.service.d/
-│           └── gpu.conf            # VOXTYPE_VULKAN_DEVICE=nvidia drop-in
-├── scripts/
-│   ├── voxtype-clean-dictation     # Groq LLM cleanup (post-process)
-│   ├── voxtype-paste-active        # auto-paste hook (terminal-aware)
-│   └── voxtype-rephrase            # Groq LLM text rephrase (selection)
-└── docs/
-    ├── architecture.md
-    ├── configuration.md
-    └── troubleshooting.md
+├── install.sh                    # bootstrap, check, uninstall, calibration
+├── Makefile                      # install/check/status/lint aliases
+├── config/                       # voxtype, smart-dictate, systemd templates
+├── scripts/                      # dictation, paste, rephrase, summarize, tray
+├── docs/                         # architecture, configuration, troubleshooting
+├── assets/                       # logo
+└── .github/workflows/release.yml # tagged release packaging
 ```
 
-## Customizing
+## Release
 
-See [docs/configuration.md](docs/configuration.md) for the full list of knobs.
-The interesting ones for tweaking the pipeline:
+Create a GitHub release by pushing a version tag:
 
-- **Hotkey**: `[hotkey] key` and `[hotkey] mode` (`push_to_talk` vs `toggle`).
-- **Languages**: `[whisper] language` accepts a list like `["tr", "en"]` so
-  Whisper constrains its language detection.
-- **Engine swap**: comment out Vulkan, switch to a Cohere / Parakeet /
-  Moonshine engine with `voxtype setup onnx`.
-- **Profiles**: the commented `[profiles.*]` section in `config/voxtype.toml`
-  lets you trigger different LLM cleanup prompts per app
-  (`voxtype record start --profile code`).
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
 
-## Architecture details
+The release workflow runs `make lint`, builds a source tarball, writes a
+`SHA256SUMS` file, and uploads both to the GitHub release.
 
-See [docs/architecture.md](docs/architecture.md). Why each piece is here,
-what the LLM cleanup prompt is trying to do, and how the auto-paste hook
-chooses Ctrl+V vs Ctrl+Shift+V.
+## Documentation
 
-## Troubleshooting
-
-See [docs/troubleshooting.md](docs/troubleshooting.md). Common issues:
-hotkey not firing, Vulkan picking the wrong GPU, post-process timing out,
-modifiers interfering with typed text.
+- [Architecture](docs/architecture.md)
+- [Configuration](docs/configuration.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-VoxType itself is MIT-licensed by Peter Jackson / Faster Agile
-(https://voxtype.io). The OpenAI Whisper model weights are downloaded at
-install time from the official HuggingFace mirror via `voxtype setup model`.
+VoxType is MIT-licensed by Peter Jackson / Faster Agile. Whisper model weights
+are downloaded at install time from the official Hugging Face mirror via
+`voxtype setup model`.

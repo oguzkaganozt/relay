@@ -1,84 +1,54 @@
 #!/usr/bin/env python3
 """
-voxtype-calibrate-mic: find the optimal capture gain for your microphone.
+voxtype-calibrate-mic: wizard-style microphone gain calibration.
 
-Records short samples at increasing gain levels, analyzes for clipping vs.
-adequate volume, and sets the best non-clipping level via amixer.
+Records ambient noise once, then steps through gain levels to find a speech
+level with safe headroom instead of the loudest possible mixer setting.
 
 Requires: sox (rec + sox stats), amixer (alsa-utils).
-Shows notifications on each step.  Final level persists across reboots
-via WirePlumber/alsa-restore.
-
-Usage:
-  voxtype-calibrate-mic              # interactive (default)
-  voxtype-calibrate-mic --list-cards # show available ALSA cards
-  voxtype-calibrate-mic -c 1         # use card 1 explicitly
 """
 import argparse
+import math
 import os
 import re
-import struct
 import subprocess
 import sys
 import tempfile
-import time
+import traceback
 
-# Minimum gain step (amixer values are 0-63).  We probe every 3 ticks
-# for speed, then binary-search near the threshold.
-STEP = 3
-# Target: peak around -2 dBFS (plenty of headroom, still loud enough)
-TARGET_PEAK_DB = -2.0
-# Recording duration per probe
-DURATION = 3
+DURATION = 4
+SAFE_NOISE_GAIN = 41
+MIN_SPEECH_GAIN = 18
+MIN_SPEECH_PEAK_DB = -35.0
+TARGET_PEAK_DB = -6.0
+MAX_PEAK_DB = -3.0
+GAIN_DB_PER_STEP = 0.75
 
 
-# ---------- helpers ----------
-
-def _notify(summary: str, body: str = "", icon: str = "audio-input-microphone") -> None:
-    try:
-        cmd = ["notify-send", f"--icon={icon}", "--app-name=smart-dictate",
-               summary]
-        if body:
-            cmd.append(body)
-        subprocess.run(cmd, timeout=3.0,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
 def _require(cmd: str, pkg: str) -> None:
-    if not subprocess.run(["which", cmd], capture_output=True).returncode == 0:
-        print(f"ERROR: {cmd} not found — install {pkg}")
+    if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
+        print(f"ERROR: {cmd} not found.  Install:  sudo apt install {pkg}")
         sys.exit(1)
-
-
-def _list_cards() -> None:
-    r = subprocess.run(["arecord", "-l"], capture_output=True, text=True)
-    print(r.stdout or "No capture devices found.")
 
 
 def _detect_card() -> int | None:
-    """Return the first card that has a capture device, or None."""
     r = subprocess.run(["arecord", "-l"], capture_output=True, text=True, timeout=5)
     m = re.search(r"card (\d+):", r.stdout)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def _get_card() -> int:
-    card = _detect_card()
-    if card is None:
-        print("ERROR: no capture-capable ALSA card found.")
-        sys.exit(1)
-    return card
+    return int(m.group(1)) if m else None
 
 
 def _set_gain(card: int, value: int) -> None:
-    subprocess.run(
+    value = max(0, min(63, value))
+    r = subprocess.run(
         ["amixer", "-c", str(card), "sset", "Capture", str(value)],
-        capture_output=True, timeout=3.0,
+        capture_output=True, text=True, timeout=3.0,
     )
+    if r.returncode != 0:
+        raise RuntimeError(f"amixer failed: {(r.stderr or r.stdout).strip()}")
 
 
 def _current_gain(card: int) -> int:
@@ -86,192 +56,369 @@ def _current_gain(card: int) -> int:
         ["amixer", "-c", str(card), "sget", "Capture"],
         capture_output=True, text=True, timeout=3.0,
     )
-    m = re.search(r"Capture (\d+)", r.stdout)
-    if m:
-        return int(m.group(1))
-    return 0
+    if r.returncode != 0:
+        raise RuntimeError(f"amixer failed: {(r.stderr or r.stdout).strip()}")
+
+    for line in r.stdout.splitlines():
+        m = re.search(r": Capture\s+(\d+)\s+\[", line)
+        if m:
+            return int(m.group(1))
+
+    raise RuntimeError("could not parse current Capture gain from amixer output")
 
 
 def _record(path: str, secs: int = DURATION) -> None:
-    subprocess.run(
-        ["rec", "-r", "16000", "-c", "1", "-b", "16", path],
-        timeout=secs + 3,
+    r = subprocess.run(
+        ["rec", "-r", "16000", "-c", "1", "-b", "16", path, "trim", "0", str(secs)],
+        capture_output=True, text=True, timeout=secs + 10,
     )
+    if r.returncode != 0:
+        raise RuntimeError(f"recording failed: {(r.stderr or r.stdout).strip()}")
 
 
-def _peak_db(path: str) -> float | None:
-    """Return peak level in dBFS.  None if file is silent/empty."""
+def _stats_output(path: str) -> str:
     r = subprocess.run(
         ["sox", path, "-n", "stats"],
         capture_output=True, text=True, timeout=5.0,
     )
-    m = re.search(r"Pk lev dB\s+(-?\d+\.?\d*)", r.stdout)
-    if m:
-        return float(m.group(1))
-    return None
+    output = f"{r.stdout}\n{r.stderr}".strip()
+    if r.returncode != 0:
+        raise RuntimeError(f"sox stats failed: {output}")
+    return output
+
+
+def _peak_db(path: str) -> float | None:
+    m = re.search(r"Pk lev dB\s+(-?\d+\.?\d*)", _stats_output(path))
+    return float(m.group(1)) if m else None
 
 
 def _clipped(path: str) -> bool:
-    """True if any sample hit exactly -1.0 or 1.0 (digital clipping)."""
-    raw = subprocess.run(
-        ["sox", path, "-t", "raw", "-"],
-        capture_output=True, timeout=5.0,
-    ).stdout
-    if len(raw) < 2:
+    stats = _stats_output(path)
+    min_match = re.search(r"Min level\s+(-?\d+\.?\d*)", stats)
+    max_match = re.search(r"Max level\s+(-?\d+\.?\d*)", stats)
+    if not min_match or not max_match:
         return False
-    samples = struct.unpack(f"<{len(raw)//2}h", raw)
-    return any(s <= -32767 or s >= 32767 for s in samples)
+    min_level = float(min_match.group(1))
+    max_level = float(max_match.group(1))
+    return min_level <= -0.999 or max_level >= 0.999
 
 
-# ---------- main ----------
+def _fmt_peak(pk: float | None) -> str:
+    return f"{pk:.1f} dBFS" if pk is not None else "---"
 
-def _say(text: str) -> None:
-    """Print and notify."""
-    print(text)
-    _notify("Mic Calibration", text)
+
+def _wait(msg: str = "Press ENTER to continue") -> None:
+    prompt = f"\n  {msg}... "
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        with open("/dev/tty", "r", encoding="utf-8") as tty:
+            tty.readline()
+    except (OSError, EOFError):
+        # Non-interactive launch (for tests/scripts). The tray path opens a
+        # real terminal, so /dev/tty should exist there and block correctly.
+        print("(no interactive terminal; continuing)", end="")
+    except KeyboardInterrupt:
+        print()
+        raise
+    print()
+
+
+def _progress(current: int, total: int) -> str:
+    filled = "●" * current + "○" * (total - current)
+    return f"[{filled}] {current}/{total}"
+
+
+def _gain_for_target_peak(gain: int, peak_db: float) -> int:
+    delta = math.floor((TARGET_PEAK_DB - peak_db) / GAIN_DB_PER_STEP)
+    return max(0, min(63, gain + delta))
+
+
+def _choose_gain(results: list[dict[str, float | int | bool]]) -> int | None:
+    speech = [
+        r for r in results
+        if r["gain"] >= MIN_SPEECH_GAIN
+        and r["peak"] is not None
+        and r["peak"] >= MIN_SPEECH_PEAK_DB
+    ]
+    if not speech:
+        return None
+
+    clean = [r for r in speech if not r["clipped"]]
+    if clean:
+        hottest = max(clean, key=lambda r: r["peak"])
+        candidate = _gain_for_target_peak(int(hottest["gain"]), float(hottest["peak"]))
+        clipped = sorted((r for r in speech if r["clipped"]), key=lambda r: r["gain"])
+        if clipped:
+            first_clip_gain = int(clipped[0]["gain"])
+            candidate = min(candidate, _gain_for_target_peak(first_clip_gain, 0.0))
+        return candidate
+
+    clipped = sorted((r for r in speech if r["clipped"]), key=lambda r: r["gain"])
+    if clipped:
+        return _gain_for_target_peak(int(clipped[0]["gain"]), 0.0)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def _run_calibration(card: int, original_gain: int) -> int:
+    committed = False
+
+    try:
+        print()
+        print("╔══════════════════════════════════════════════╗")
+        print("║     Microphone Gain Calibration              ║")
+        print("╠══════════════════════════════════════════════╣")
+        print("║  First I record ambient noise (stay quiet).  ║")
+        print("║  Then I target safe speech headroom, not the ║")
+        print("║  loudest possible mixer setting.             ║")
+        print("╚══════════════════════════════════════════════╝")
+        print(f"  Current: {original_gain}/63 ({round(original_gain/63*100)}%)")
+        print()
+
+        # ----- step 1: ambient noise floor -----
+        noise_gain = min(original_gain, SAFE_NOISE_GAIN)
+        if noise_gain != original_gain:
+            print(
+                f"  Current gain is hot; measuring noise at safe gain "
+                f"{noise_gain}/63 first."
+            )
+            _set_gain(card, noise_gain)
+            print()
+
+        _wait("Press ENTER to measure noise (stay quiet for 3s)")
+        print()
+        print("  [1/2] Noise floor...", end=" ", flush=True)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        noise_path = tmp.name
+        tmp.close()
+        try:
+            _record(noise_path, 3)
+            noise_db = _peak_db(noise_path)
+            noise_clip = _clipped(noise_path)
+        finally:
+            if os.path.exists(noise_path):
+                os.unlink(noise_path)
+
+        if noise_clip:
+            print("CLIPPED ⚠")
+            print("  Ambient noise is already clipping!  Check your environment.")
+            return 1
+
+        print(f"{_fmt_peak(noise_db)}  (good)")
+        print()
+
+        # ----- step 2: sweep gain levels -----
+        # Steps: 0, 9, 18, 27, 36, 45, 54, 63 — 8 levels
+        levels = list(range(0, 64, 9))
+        total = len(levels)
+        results = []
+
+        _wait("Press ENTER to start gain sweep — I'll tell you when to speak")
+        print()
+
+        for i, v in enumerate(levels):
+            _set_gain(card, v)
+            prompt = _progress(i + 1, total)
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            path = tmp.name
+            tmp.close()
+            try:
+                # Low gains are usually unusable here, so don't make the user
+                # speak until the level is likely to contain speech.
+                if v < MIN_SPEECH_GAIN:
+                    print(
+                        f"  {prompt}  Gain {v:>2}/63  "
+                        "(too quiet, skipping)...",
+                        end=" ", flush=True,
+                    )
+                    _record(path, 3)
+                else:
+                    print(
+                        f"  {prompt}  Gain {v:>2}/63 → SPEAK LOUDLY NOW:",
+                        end=" ", flush=True,
+                    )
+                    _record(path, DURATION)
+
+                pk = _peak_db(path)
+                clip = _clipped(path)
+                results.append({"gain": v, "peak": pk, "clipped": clip})
+                status = "CLIP ⚠" if clip else _fmt_peak(pk)
+                print(status)
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
+
+            if clip and v > 0:
+                break
+
+        # ----- fine-tune: binary search between last-good and first-clip -----
+        clipped = [r for r in results if r["clipped"]]
+        clean = [r for r in results if not r["clipped"] and r["peak"] is not None]
+
+        if clipped and clean:
+            lo = max(r["gain"] for r in clean)
+            hi = min(r["gain"] for r in clipped)
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                _set_gain(card, mid)
+                print(
+                    f"  Fine-tune  Gain {mid:>2}/63 → SPEAK LOUDLY NOW:",
+                    end=" ", flush=True,
+                )
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                path = tmp.name
+                tmp.close()
+                try:
+                    _record(path, DURATION)
+                    pk = _peak_db(path)
+                    clip = _clipped(path)
+                    results.append({"gain": mid, "peak": pk, "clipped": clip})
+                    status = "CLIP ⚠" if clip else _fmt_peak(pk)
+                    print(status)
+                finally:
+                    if os.path.exists(path):
+                        os.unlink(path)
+
+                if clip:
+                    hi = mid
+                else:
+                    lo = mid
+        best = _choose_gain(results)
+        if best is None:
+            print("  Could not capture a usable speech level.")
+            return 1
+
+        # ----- verify -----
+        for attempt in range(4):
+            _set_gain(card, best)
+            action = "Verify" if attempt == 0 else "Back off"
+            print(
+                f"  {action} at  Gain {best:>2}/63 → SPEAK LOUDLY NOW:",
+                end=" ", flush=True,
+            )
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            path = tmp.name
+            tmp.close()
+            try:
+                _record(path, DURATION)
+                final_pk = _peak_db(path)
+                final_clip = _clipped(path)
+                status = "CLIP ⚠" if final_clip else _fmt_peak(final_pk)
+                print(status)
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
+
+            if final_pk is None:
+                print("  Could not read the verification level.")
+                return 1
+
+            if final_pk < MIN_SPEECH_PEAK_DB:
+                print("  Verification was too quiet; please speak during the prompt.")
+                continue
+
+            if not final_clip and final_pk <= MAX_PEAK_DB:
+                break
+
+            hot_peak = 0.0 if final_clip else final_pk
+            next_best = _gain_for_target_peak(best, hot_peak)
+            if next_best >= best:
+                next_best = best - 1
+            best = max(0, next_best)
+        else:
+            print("  Could not find a gain with enough headroom.")
+            return 1
+
+        _set_gain(card, best)
+
+        if final_clip:
+            print("  Could not find a non-clipping gain. Restoring previous setting.")
+            return 1
+
+        # ----- summary -----
+        final_gain = _current_gain(card)
+        pct = round(final_gain / 63 * 100)
+
+        print()
+        print("╔══════════════════════════════════════════════╗")
+        print("║     Calibration Complete                      ║")
+        print("╠══════════════════════════════════════════════╣")
+        print(f"║  Gain          {final_gain:>3}/63 ({pct:>2}%)                     ║")
+        print(f"║  Peak level    {_fmt_peak(final_pk):>10}              ║")
+        print(f"║  Clipping      {'YES ⚠' if final_clip else 'No ✓':>10}              ║")
+
+        if noise_db is not None and final_pk is not None:
+            snr = final_pk - noise_db
+            print(f"║  SNR           {snr:>3.0f} dB                       ║")
+            print("║                                              ║")
+            if snr > 25:
+                print("║  ★ Excellent — quiet room, good mic            ║")
+            elif snr > 15:
+                print("║  ★ Good — adequate for dictation               ║")
+            elif snr > 10:
+                print("║  ⚠ Fair — consider moving closer to the mic    ║")
+            else:
+                print("║  ✗ Poor — background noise or mic too far      ║")
+
+        print("╚══════════════════════════════════════════════╝")
+        print()
+        print("  Settings persist across reboots automatically.")
+        print()
+
+        committed = True
+        try:
+            _wait("Press ENTER to close")
+        except KeyboardInterrupt:
+            print()
+        return 0
+    finally:
+        if not committed:
+            _set_gain(card, original_gain)
+            print(f"  Restored previous gain: {original_gain}/63")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Calibrate microphone gain")
     parser.add_argument("--list-cards", action="store_true",
-                        help="List available ALSA capture cards and exit")
+                        help="List ALSA capture cards and exit")
     parser.add_argument("-c", "--card", type=int, default=None,
-                        help="ALSA card index (auto-detected if omitted)")
+                        help="ALSA card index (auto-detected)")
     args = parser.parse_args()
 
     if args.list_cards:
-        _list_cards()
+        r = subprocess.run(["arecord", "-l"], capture_output=True, text=True)
+        print(r.stdout or "No capture devices found.")
         return 0
 
     _require("rec", "sox")
     _require("sox", "sox")
     _require("amixer", "alsa-utils")
 
-    card = args.card if args.card is not None else _get_card()
-    print(f"Using ALSA card {card}")
-    print()
-
-    # ----- step 1: ambient noise floor -----
-    _say("Step 1/3: Recording ambient noise (3s) — stay quiet...")
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    noise_path = tmp.name
-    tmp.close()
-    _record(noise_path, 3)
-    noise_db = _peak_db(noise_path)
-    noise_clip = _clipped(noise_path)
-    os.unlink(noise_path)
-    print(f"  Noise floor: {noise_db or 'N/A'} dBFS  clipped={noise_clip}")
-    print()
-
-    if noise_clip:
-        _say("Your ambient noise alone is clipping!  Check your "
-             "environment (fan / AC / wind).")
+    card = args.card if args.card is not None else _detect_card()
+    if card is None:
+        print("ERROR: no capture-capable ALSA card found.")
         return 1
 
-    # ----- step 2: find the best gain -----
-    _say("Step 2/3: Finding optimal gain — speak at your normal "
-         f"dictation volume when prompted (×{DURATION}s each)...")
-
-    best = _current_gain(card)
-    results: list[dict] = []
-
-    # Coarse sweep: 0 → 63, step 6
-    coarse = []
-    for v in range(0, 64, 6):
-        _set_gain(card, v)
-        _say(f"  Gain {v}/63 — speak now...")
-        tmp2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        probe = tmp2.name
-        tmp2.close()
-        _record(probe, DURATION)
-        pk = _peak_db(probe)
-        clip = _clipped(probe)
-        results.append({"gain": v, "peak": pk, "clipped": clip})
-        print(f"    peak={pk:.1f} dBFS  clipped={clip}")
-        if clip and v > 0:
-            # Back off one step
-            best = v - 6
-            break
-        best = v
-        os.unlink(probe)
-
-    # Fine-tune: binary search between last good and first clipped
-    if results and results[-1]["clipped"]:
-        lo = max(r["gain"] for r in results if not r["clipped"])
-        hi = min(r["gain"] for r in results if r["clipped"])
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            _set_gain(card, mid)
-            _say(f"  Fine-tuning at gain {mid}/63 — speak now...")
-            tmp3 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            probe = tmp3.name
-            tmp3.close()
-            _record(probe, DURATION)
-            pk = _peak_db(probe)
-            clip = _clipped(probe)
-            print(f"    peak={pk:.1f} dBFS  clipped={clip}")
-            if clip:
-                hi = mid
-            else:
-                lo = mid
-            os.unlink(probe)
-        best = lo
-
-    # Ensure we have at least 3 dB of headroom
-    _set_gain(card, best)
-    _say(f"  Verifying gain {best}/63 — speak normally...")
-    tmp4 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    verify = tmp4.name
-    tmp4.close()
-    _record(verify, DURATION)
-    final_pk = _peak_db(verify)
-    final_clip = _clipped(verify)
-    print(f"    peak={final_pk:.1f} dBFS  clipped={final_clip}")
-
-    if final_clip or (final_pk is not None and final_pk > -1.5):
-        # Too hot — step down one more tick
-        best = max(0, best - 1)
-        _set_gain(card, best)
-        _say(f"  Backing off to {best}/63 — speak once more...")
-        _record(verify, DURATION)
-        final_pk = _peak_db(verify)
-        final_clip = _clipped(verify)
-
-    os.unlink(verify)
-
-    # ----- step 3: summary -----
-    current_vol = _current_gain(card)
-    pct = round(current_vol / 63 * 100)
-
-    _say(
-        f"Step 3/3: Done!  Gain set to {current_vol}/63 ({pct}%)",
-        f"Peak: {final_pk:.1f} dBFS  Clipping: {final_clip}",
-    )
-
-    print()
-    print(f"  Gain:       {current_vol}/63 ({pct}%)")
-    print(f"  Peak level: {final_pk:.1f} dBFS")
-    print(f"  Clipping:   {'YES ⚠' if final_clip else 'No ✓'}")
-    print()
-
-    snr = None
-    if noise_db is not None and final_pk is not None:
-        snr = final_pk - noise_db
-        print(f"  SNR:        {snr:.0f} dB")
+    original_gain = _current_gain(card)
+    try:
+        return _run_calibration(card, original_gain)
+    except KeyboardInterrupt:
         print()
-        if snr > 25:
-            print("  ★ Excellent — mic is well positioned and room is quiet.")
-        elif snr > 15:
-            print("  ★ Good — adequate for dictation.")
-        elif snr > 10:
-            print("  ⚠ Fair — consider moving closer to the mic.")
-        else:
-            print("  ✗ Poor — too much background noise or mic too far.")
-
-    print()
-    print("Settings persist automatically via WirePlumber / alsa-restore.")
-    return 0
+        _set_gain(card, original_gain)
+        print(f"  Calibration cancelled; restored gain {original_gain}/63.")
+        return 130
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        print("\n  ERROR: Calibration crashed unexpectedly.")
+        traceback.print_exc()
+        _wait("Press ENTER to close")
+        sys.exit(1)
