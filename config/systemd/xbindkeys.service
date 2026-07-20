@@ -4,7 +4,7 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=/usr/bin/xbindkeys -n -f %h/.xbindkeysrc
+ExecStart=/usr/bin/xbindkeys -n -f %h/.config/relay/xbindkeysrc
 Restart=on-failure
 RestartSec=3
 Environment=DISPLAY=${DISPLAY_PLACEHOLDER}

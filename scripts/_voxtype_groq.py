@@ -107,14 +107,21 @@ def token_budget(input_text: str, system_prompt: str, *,
     return min(max(floor, tpm - input_tokens - overhead), ceiling)
 
 
-def build_payload(model: str, system_prompt: str, user_content: str, *,
+def build_payload(model: str, system_prompt: str, user_content, *,
                   temperature: float, max_completion_tokens: int) -> dict:
+    """Build a chat-completions payload. user_content may be a string (text
+    only) or a list of OpenAI-compatible content blocks (text + image_url) for
+    vision models."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+    if isinstance(user_content, str):
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": user_content})
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
+        "messages": messages,
         "temperature": temperature,
         "max_completion_tokens": max_completion_tokens,
     }
@@ -122,6 +129,36 @@ def build_payload(model: str, system_prompt: str, user_content: str, *,
     if effort is not None:
         payload["reasoning_effort"] = effort
     return payload
+
+
+def text_image_content(text: str, image_b64: str | None) -> str | list:
+    """Return a string (text only) or a multimodal content list (text + image).
+    image_b64 is a raw base64 PNG string."""
+    if not image_b64:
+        return text
+    return [
+        {"type": "text", "text": text},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+    ]
+
+
+DEFAULT_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+
+def resolve_vision_model(groq_cfg: dict, section_cfg: dict = None, env_prefix: str = None) -> str:
+    """Vision model precedence: <PREFIX>_VISION_MODEL env > [section].vision_model
+    > VISION_MODEL env > [groq].vision_model > built-in default. Falls back to
+    resolve_model when no vision model is configured (text+image to a text
+    model will error at the API; the caller checks has_image first)."""
+    section_cfg = section_cfg or {}
+    return _first(
+        os.environ.get(f"{env_prefix}_VISION_MODEL") if env_prefix else "",
+        section_cfg.get("vision_model"),
+        os.environ.get("VISION_MODEL"),
+        groq_cfg.get("vision_model"),
+        DEFAULT_VISION_MODEL,
+    )
 
 
 def call_groq(endpoint: str, api_key: str, payload: dict, *,

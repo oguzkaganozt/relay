@@ -47,6 +47,7 @@ shows an `Upgrade` item when an update is available.
 | Hotkey | Action |
 | --- | --- |
 | `RIGHTCTRL` | Toggle dictation |
+| `Ctrl+Alt+Space` | Open the Relay Bar |
 | `Ctrl+Alt+R` | Rewrite selected text (Groq) |
 | `Ctrl+Alt+S` | Summarize selected text (Groq) |
 
@@ -58,7 +59,8 @@ Key files under `~/.config/`:
 | --- | --- |
 | `voxtype/config.toml` | VoxType daemon (hotkey, model, paste) |
 | `relay/config.toml` | Groq model, prompts |
-| `xbindkeysrc` | Rephrase / summarize key bindings |
+| `relay/settings.toml` | V2 privacy toggles (cloud processing, context sharing) |
+| `relay/xbindkeysrc` | Relay key bindings (rephrase / summarize / Relay Bar) |
 
 API key lookup: `GROQ_API_KEY` env -> `relay/config.toml` ->
 `voxtype/groq-api-key` -> installer prompt.

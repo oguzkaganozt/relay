@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""relay-feasibility: probe V2 platform capabilities on the current desktop.
+
+Reports what Relay V2's context engine can rely on HERE, on THIS session:
+  - session type (X11 / Wayland / XWayland)
+  - active window identification (id, title, WM_CLASS, geometry)
+  - non-invasive PRIMARY selection read
+  - single-window screenshot capture
+  - paste-target re-verification (focus-change detection)
+  - VoxType hooks and the (lack of a) context session
+
+Stdlib only. Degrades gracefully: a missing tool or a failed probe is
+reported as such and never crashes. Run on the target Ubuntu 24.04 desktop
+(X11 or GNOME Wayland) and share the output.
+
+Usage: scripts/relay-feasibility [--json]
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+TIMEOUT = 6.0
+
+
+def _run(cmd, timeout=TIMEOUT):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", "command not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:
+        return 1, "", f"{type(e).__name__}: {e}"
+
+
+def _have(name):
+    return shutil.which(name) is not None
+
+
+def _clip(s, n=300):
+    s = s.replace("\n", " ")
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def probe_session():
+    st = os.environ.get("XDG_SESSION_TYPE", "")
+    wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or st == "wayland"
+    x11 = bool(os.environ.get("DISPLAY"))
+    return {
+        "status": "ok",
+        "xdg_session_type": st or "(unset)",
+        "DISPLAY": os.environ.get("DISPLAY", "(unset)"),
+        "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", "(unset)"),
+        "detected": "wayland" if wayland else ("x11" if x11 else "none"),
+        "note": "DISPLAY is set under GNOME Wayland too (XWayland); xdotool sees X apps only there.",
+    }
+
+
+def probe_active_window_x11():
+    if not _have("xdotool"):
+        return {"status": "missing", "detail": "xdotool not installed"}
+    rc, wid, err = _run(["xdotool", "getactivewindow"])
+    if rc != 0:
+        return {"status": "error", "detail": _clip(err or "getactivewindow failed")}
+    _, name, _ = _run(["xdotool", "getwindowname", wid])
+    cls = _run(["xdotool", "getwindowclassname", wid])[1]
+    if not cls and _have("xprop"):
+        _, xp, _ = _run(["xprop", "-id", wid, "WM_CLASS"])
+        vals = re.findall(r'"([^"]*)"', xp)
+        cls = " ".join(vals) if vals else ""
+    _, geo, _ = _run(["xdotool", "getwindowgeometry", wid])
+    return {"status": "ok", "id": wid, "title": _clip(name, 120),
+            "wm_class": cls, "geometry": _clip(geo, 120)}
+
+
+def probe_active_window_wayland():
+    if not _have("gdbus"):
+        return {"status": "missing", "detail": "gdbus not installed"}
+    # Native Wayland windows are invisible to xdotool; GNOME exposes them via
+    # org.gnome.Shell.Introspect (restricted on some versions) or Shell.Eval
+    # (gated by unsafe-mode). Detect, then attempt a call.
+    rc, out, err = _run([
+        "gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+        "--object-path", "/org/gnome/Shell/Introspect",
+        "--method", "org.gnome.Shell.Introspect.GetWindows",
+    ])
+    if rc == 0:
+        return {"status": "ok", "source": "org.gnome.Shell.Introspect.GetWindows",
+                "raw": _clip(out, 400)}
+    rc2, out2, err2 = _run([
+        "gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+        "--object-path", "/org/gnome/Shell", "--method", "org.gnome.Shell.Eval",
+        "global.get_window_actors().length",
+    ])
+    if rc2 == 0:
+        return {"status": "partial", "source": "org.gnome.Shell.Eval",
+                "detail": "Eval reachable (needs unsafe-mode for real introspection); "
+                          "Introspect failed: " + _clip(err, 120)}
+    return {"status": "unsupported",
+            "detail": "neither Shell.Introspect nor Shell.Eval reachable: "
+                      + _clip(err or err2, 200)}
+
+
+def probe_selection_x11():
+    for tool, cmd in (("xclip", ["xclip", "-o", "-selection", "primary"]),
+                      ("xsel", ["xsel", "-o", "-p"])):
+        if _have(tool):
+            rc, out, err = _run(cmd)
+            if rc == 0:
+                return {"status": "ok", "tool": tool, "length": len(out),
+                        "preview": _clip(out, 120)}
+            return {"status": "error", "tool": tool, "detail": _clip(err, 200)}
+    return {"status": "missing", "detail": "neither xclip nor xsel installed"}
+
+
+def probe_selection_wayland():
+    if _have("wl-paste"):
+        rc, out, err = _run(["wl-paste", "--primary", "--no-newline"])
+        if rc == 0:
+            return {"status": "ok", "tool": "wl-paste --primary",
+                    "length": len(out), "preview": _clip(out, 120)}
+        return {"status": "error", "detail": _clip(err, 200)}
+    return {"status": "missing", "detail": "wl-clipboard (wl-paste) not installed"}
+
+
+def probe_screenshot_x11(wid):
+    have = [t for t in ("import", "scrot", "gnome-screenshot") if _have(t)]
+    if not have:
+        return {"status": "missing",
+                "detail": "no capture tool (apt: imagemagick | scrot | gnome-screenshot)",
+                "available_tools": []}
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, prefix="relay-feas-")
+    tmp.close()
+    tool, cmd = None, None
+    if _have("import") and wid:
+        tool, cmd = "import", ["import", "-window", wid, tmp.name]
+    elif _have("scrot"):
+        tool, cmd = "scrot", ["scrot", "-u", tmp.name]
+    elif _have("gnome-screenshot"):
+        tool, cmd = "gnome-screenshot", ["gnome-screenshot", "-w", "-f", tmp.name]
+    rc, out, err = _run(cmd)
+    size = os.path.getsize(tmp.name) if os.path.exists(tmp.name) else 0
+    return {
+        "status": "ok" if rc == 0 and size > 0 else "error",
+        "tool": tool, "path": tmp.name, "bytes": size,
+        "detail": _clip(err, 200) or "",
+    }
+
+
+def probe_screenshot_wayland():
+    res = {"has_grim": _have("grim"),
+           "has_xdg_desktop_portal": _have("xdg-desktop-portal")}
+    rc, out, err = _run([
+        "gdbus", "introspect", "--session", "--dest", "org.freedesktop.portal.Desktop",
+        "--object-path", "/org/freedesktop/portal/desktop",
+    ])
+    if rc == 0:
+        res["portal_screenshot_iface"] = "present" if "Screenshot" in out else "absent"
+    else:
+        res["portal_screenshot_iface"] = "unreachable"
+    res["status"] = "ok" if (res["has_grim"] or res["portal_screenshot_iface"] == "present") else "unsupported"
+    res["note"] = "GNOME Wayland uses the Screenshot portal (interactive consent); grim is wlroots-only."
+    return res
+
+
+def probe_paste_target_x11():
+    if not _have("xdotool"):
+        return {"status": "missing", "detail": "xdotool not installed"}
+    _, w1, _ = _run(["xdotool", "getactivewindow"])
+    _, w2, _ = _run(["xdotool", "getactivewindow"])
+    stable = bool(w1 and w1 == w2)
+    return {"status": "ok", "stable": stable, "window1": w1, "window2": w2,
+            "note": "stable=True means focus re-verification (V2 stale-target check) "
+                    "is feasible on X11."}
+
+
+def probe_voxtype():
+    if not _have("voxtype"):
+        return {"status": "missing", "detail": "voxtype not installed"}
+    rc, ver, _ = _run(["voxtype", "--version"])
+    _, rec, _ = _run(["voxtype", "record", "--help"])
+    rc_ctx, ctx, _ = _run(["voxtype", "context"])
+    return {
+        "status": "ok",
+        "version": _clip(ver, 80),
+        "record_help": _clip(rec, 300),
+        "context_subcommand": f"absent (exit {rc_ctx})",
+        "context_detail": _clip(ctx, 160),
+        "finding": "NO context session in voxtype: only `record start/stop/toggle/cancel "
+                   "[--profile]` + config hooks (post_process_command, post_output_command). "
+                   "Relay must build the context layer itself and pass it via a sidecar/env, "
+                   "since voxtype only pipes the transcript on stdin.",
+    }
+
+
+def build_report():
+    sess = probe_session()
+    aw_x = probe_active_window_x11()
+    return {
+        "session": sess,
+        "active_window.x11": aw_x,
+        "active_window.wayland": probe_active_window_wayland(),
+        "selection.x11": probe_selection_x11(),
+        "selection.wayland": probe_selection_wayland(),
+        "screenshot.x11": probe_screenshot_x11(aw_x.get("id") if aw_x.get("status") == "ok" else None),
+        "screenshot.wayland": probe_screenshot_wayland(),
+        "paste_target.x11": probe_paste_target_x11(),
+        "voxtype": probe_voxtype(),
+    }
+
+
+_MARK = {"ok": "[ ok  ] ", "missing": "[miss] ", "unsupported": "[unsup] ",
+         "error": "[ err ] ", "partial": "[part] "}
+
+
+def report_human(report):
+    print("relay-feasibility — V2 platform capability probe")
+    print("=" * 60)
+    for area, data in report.items():
+        st = data.get("status", "?")
+        print(f"{_MARK.get(st, '[????] ')}{area}")
+        for k, v in data.items():
+            if k == "status":
+                continue
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v, ensure_ascii=False)
+            print(f"          {k}: {_clip(str(v), 240)}")
+        print()
+
+
+def main():
+    as_json = "--json" in sys.argv
+    report = build_report()
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        report_human(report)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

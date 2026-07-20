@@ -1,6 +1,10 @@
+# Relay: open the Relay Bar
+"$HOME/.local/bin/relay-bar"
+    ${RELAY_BAR_BIND}
+
 # Relay: rephrase selected text
-# NOTE: ${REPHRASE_BIND} and ${SUMMARIZE_BIND} are template variables
-# resolved by install.sh.  $HOME is expanded by xbindkeys at runtime.
+# NOTE: the key bindings below are template variables resolved by install.sh.
+# $HOME is expanded by xbindkeys at runtime.
 "$HOME/.local/bin/voxtype-rephrase"
     ${REPHRASE_BIND}
 

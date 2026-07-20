@@ -164,6 +164,62 @@ class BuildPayloadTests(unittest.TestCase):
                                temperature=0.0, max_completion_tokens=10)
         self.assertNotIn("reasoning_effort", p)
 
+    def test_accepts_list_user_content_for_vision(self):
+        content = [{"type": "text", "text": "hi"},
+                   {"type": "image_url", "image_url": {"url": "data:..."}}]
+        p = groq.build_payload("vision-m", "s", content,
+                               temperature=0.0, max_completion_tokens=10)
+        self.assertEqual(p["messages"][1]["content"], content)
+
+
+class TextImageContentTests(unittest.TestCase):
+    def test_text_only_returns_string(self):
+        self.assertEqual(groq.text_image_content("hi", None), "hi")
+        self.assertEqual(groq.text_image_content("hi", ""), "hi")
+
+    def test_with_image_returns_multimodal_list(self):
+        c = groq.text_image_content("hi", "ZmFrZQ==")
+        self.assertIsInstance(c, list)
+        self.assertEqual(c[0], {"type": "text", "text": "hi"})
+        self.assertEqual(c[1]["type"], "image_url")
+        self.assertIn("data:image/png;base64,ZmFrZQ==",
+                      c[1]["image_url"]["url"])
+
+
+class ResolveVisionModelTests(unittest.TestCase):
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        for k in ["VISION_MODEL", "REPHRASE_VISION_MODEL"]:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_default(self):
+        self.assertEqual(groq.resolve_vision_model({}), groq.DEFAULT_VISION_MODEL)
+
+    def test_groq_cfg_used(self):
+        self.assertEqual(
+            groq.resolve_vision_model({"vision_model": "vm1"}), "vm1")
+
+    def test_env_wins(self):
+        os.environ["VISION_MODEL"] = "envvm"
+        self.assertEqual(
+            groq.resolve_vision_model({"vision_model": "vm1"}), "envvm")
+
+    def test_prefix_env_wins(self):
+        os.environ["REPHRASE_VISION_MODEL"] = "prefixvm"
+        os.environ["VISION_MODEL"] = "envvm"
+        self.assertEqual(
+            groq.resolve_vision_model({}, {"vision_model": "sec"}, "REPHRASE"),
+            "prefixvm")
+
+    def test_section_cfg_beats_groq(self):
+        self.assertEqual(
+            groq.resolve_vision_model({"vision_model": "g"}, {"vision_model": "s"}),
+            "s")
+
 
 if __name__ == "__main__":
     unittest.main()

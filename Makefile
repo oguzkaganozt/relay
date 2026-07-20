@@ -30,12 +30,18 @@ clean-api-key:     ## remove ~/.config/voxtype/groq-api-key
 lint:              ## bash -n + py_compile + sh -n sweep
 	@bash -n install.sh && echo "install.sh: bash -n ok"
 	@python3 -m py_compile scripts/_voxtype_groq.py && echo "_voxtype_groq: py_compile ok"
+	@python3 -m py_compile scripts/_relay_actions.py && echo "_relay_actions: py_compile ok"
+	@python3 -m py_compile scripts/_relay_settings.py && echo "_relay_settings: py_compile ok"
+	@python3 -m py_compile scripts/_relay_context.py && echo "_relay_context: py_compile ok"
 	@python3 -m py_compile scripts/voxtype-clean-dictation && echo "voxtype-clean-dictation: py_compile ok"
 	@python3 -m py_compile scripts/voxtype-rephrase && echo "voxtype-rephrase: py_compile ok"
 	@python3 -m py_compile scripts/voxtype-summarize && echo "voxtype-summarize: py_compile ok"
 	@python3 -m py_compile scripts/voxtype-tray && echo "voxtype-tray: py_compile ok"
 	@python3 -m py_compile scripts/voxtype-calibrate-mic && echo "voxtype-calibrate-mic: py_compile ok"
 	@python3 -m py_compile scripts/relay && echo "relay: py_compile ok"
+	@python3 -m py_compile scripts/relay-bar && echo "relay-bar: py_compile ok"
+	@python3 -m py_compile scripts/relay-feasibility && echo "relay-feasibility: py_compile ok"
+	@python3 -m py_compile scripts/relay-acceptance && echo "relay-acceptance: py_compile ok"
 	@sh -n scripts/voxtype-paste-active && echo "voxtype-paste-active: sh -n ok"
 
 # Stdlib unittest suite (no pip deps). Covers the pure dictation logic.

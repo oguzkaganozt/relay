@@ -41,6 +41,7 @@ export YDOTOOL_SOCKET
 
 # --- terminal detection (best effort, X11/XWayland only) ---------------
 target=""
+window_id=""
 if command -v xdotool >/dev/null 2>&1; then
   window_id="$(xdotool getactivewindow 2>/dev/null || true)"
   if [ -n "$window_id" ]; then
@@ -49,6 +50,28 @@ if command -v xdotool >/dev/null 2>&1; then
     window_name="$(xdotool getwindowname "$window_id" 2>/dev/null || true)"
     target="$(printf '%s %s %s' "$window_class" "$wm_class" "$window_name" \
       | tr '[:upper:]' '[:lower:]')"
+  fi
+fi
+
+# --- V2 stale-target check for dictation ---------------------------------
+# If the Relay bar captured a snapshot before dictation, verify the active
+# window hasn't changed. If it has, skip the paste and notify the user
+# (V2: "kullanıcı dikte sırasında başka pencereye geçmişse sonuç otomatik
+# yazılmaz; clipboard'a kopyalanır ve kısa bir uyarı gösterilir").
+relay_snapshot="${XDG_CONFIG_HOME:-$HOME/.config}/relay/context/active.json"
+if [ -f "$relay_snapshot" ] && [ -n "$window_id" ]; then
+  origin_wid="$(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$relay_snapshot'))
+    print(d.get('window_id',''))
+except: pass
+" 2>/dev/null || true)"
+  if [ -n "$origin_wid" ] && [ "$origin_wid" != "$window_id" ]; then
+    notify-send --icon=edit-paste --app-name=relay \
+      "Hedef değişti" "Sonuç panoya kopyalandı (diket sırasında pencere değişti)" \
+      >/dev/null 2>&1 || true
+    exit 0
   fi
 fi
 

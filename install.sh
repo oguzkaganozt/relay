@@ -155,6 +155,7 @@ SKIP_MODEL=0
 DICTATION_KEY="RIGHTCTRL"
 REPHRASE_BIND="control + alt + r"
 SUMMARIZE_BIND="control + alt + s"
+RELAY_BAR_BIND="control + alt + space"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -275,7 +276,8 @@ preflight() {
 REQUIRED_PACKAGES=(voxtype xdotool xclip ydotool wtype wl-clipboard
                    libnotify-bin pipewire-alsa sox playerctl libvulkan1
                    mesa-vulkan-drivers
-                   gir1.2-ayatanaappindicator3-0.1 xbindkeys)
+                   gir1.2-ayatanaappindicator3-0.1 xbindkeys
+                   imagemagick)
 
 missing_packages() {
   local miss=()
@@ -458,6 +460,12 @@ step_scripts() {
     local rendered
     install -m 0644 "$SCRIPT_SRC_DIR/_voxtype_groq.py" \
       "$SCRIPT_DST_DIR/_voxtype_groq.py"
+    install -m 0644 "$SCRIPT_SRC_DIR/_relay_actions.py" \
+      "$SCRIPT_DST_DIR/_relay_actions.py"
+    install -m 0644 "$SCRIPT_SRC_DIR/_relay_settings.py" \
+      "$SCRIPT_DST_DIR/_relay_settings.py"
+    install -m 0644 "$SCRIPT_SRC_DIR/_relay_context.py" \
+      "$SCRIPT_DST_DIR/_relay_context.py"
     install -m 0755 "$SCRIPT_SRC_DIR/voxtype-clean-dictation" \
       "$SCRIPT_DST_DIR/voxtype-clean-dictation"
     install -m 0755 "$SCRIPT_SRC_DIR/voxtype-paste-active" \
@@ -471,12 +479,26 @@ step_scripts() {
     install -m 0755 "$SCRIPT_SRC_DIR/voxtype-calibrate-mic" \
       "$SCRIPT_DST_DIR/voxtype-calibrate-mic"
     install -m 0755 "$SCRIPT_SRC_DIR/relay" "$SCRIPT_DST_DIR/relay"
+    install -m 0755 "$SCRIPT_SRC_DIR/relay-bar" "$SCRIPT_DST_DIR/relay-bar"
+    install -m 0755 "$SCRIPT_SRC_DIR/relay-feasibility" "$SCRIPT_DST_DIR/relay-feasibility"
+    install -m 0755 "$SCRIPT_SRC_DIR/relay-acceptance" "$SCRIPT_DST_DIR/relay-acceptance"
     rendered="$(mktemp)"
-    sed -e "s|\${REPHRASE_BIND}|$REPHRASE_BIND|g" \
+    sed -e "s|\${RELAY_BAR_BIND}|$RELAY_BAR_BIND|g" \
+         -e "s|\${REPHRASE_BIND}|$REPHRASE_BIND|g" \
          -e "s|\${SUMMARIZE_BIND}|$SUMMARIZE_BIND|g" \
          "$SCRIPT_DIR/config/xbindkeysrc" > "$rendered"
-    install -m 0644 "$rendered" "$HOME/.xbindkeysrc"
+    # Relay owns its xbindkeys config under ~/.config/relay/ (preserved across
+    # reinstalls). The user's ~/.xbindkeysrc is never written or removed; a
+    # user who runs their own xbindkeys keeps their bindings untouched.
+    run mkdir -p "$RELAY_CONFIG_DIR"
+    local had_relay_xbindkeys=1
+    [[ -f "$RELAY_CONFIG_DIR/xbindkeysrc" ]] || had_relay_xbindkeys=0
+    install -m 0644 "$rendered" "$RELAY_CONFIG_DIR/xbindkeysrc"
     rm -f "$rendered"
+    if [[ "$had_relay_xbindkeys" -eq 0 && -f "$HOME/.xbindkeysrc" ]]; then
+      warn "Relay no longer manages ~/.xbindkeysrc; its bindings now live in $RELAY_CONFIG_DIR/xbindkeysrc."
+      warn "If ~/.xbindkeysrc only held old Relay bindings you can delete it:  rm ~/.xbindkeysrc"
+    fi
   fi
 }
 
@@ -639,10 +661,10 @@ verify() {
   else
     err "source:   $RELAY_SOURCE_DST MISSING"; fail=1
   fi
-  if [[ -f "$HOME/.xbindkeysrc" ]]; then
-    ok "config:   $HOME/.xbindkeysrc"
+  if [[ -f "$RELAY_CONFIG_DIR/xbindkeysrc" ]]; then
+    ok "config:   $RELAY_CONFIG_DIR/xbindkeysrc"
   else
-    err "config:   $HOME/.xbindkeysrc MISSING"; fail=1
+    err "config:   $RELAY_CONFIG_DIR/xbindkeysrc MISSING"; fail=1
   fi
 
   if [[ -f "$SYSTEMD_DST_DIR/voxtype.service" ]]; then
@@ -732,8 +754,13 @@ do_uninstall() {
   rm -f  "$SCRIPT_DST_DIR/voxtype-tray"
   rm -f  "$SCRIPT_DST_DIR/voxtype-calibrate-mic"
   rm -f  "$SCRIPT_DST_DIR/relay"
+  rm -f  "$SCRIPT_DST_DIR/relay-bar"
+  rm -f  "$SCRIPT_DST_DIR/relay-feasibility"
+  rm -f  "$SCRIPT_DST_DIR/relay-acceptance"
   rm -f  "$SCRIPT_DST_DIR/_voxtype_groq.py"
-  rm -f  "$HOME/.xbindkeysrc"
+  rm -f  "$SCRIPT_DST_DIR/_relay_actions.py"
+  rm -f  "$SCRIPT_DST_DIR/_relay_settings.py"
+  rm -f  "$SCRIPT_DST_DIR/_relay_context.py"
   rm -f  "$SYSTEMD_DST_DIR/xbindkeys.service"
   rm -f  "$SYSTEMD_DST_DIR/ydotoold.service"
 

@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""relay-bar: the Relay Bar surface (V2 steps 4-9).
+
+A transient GTK3 window opened by the Ctrl+Alt+Space global shortcut. It:
+  - captures a context snapshot BEFORE taking focus (V2 "Ortak Context
+    Engine"): active app/title, selected text
+  - shows the action set, the live context line, a free-text entry, settings
+  - runs Relay Actions via the common action model (_relay_actions +
+    _voxtype_groq), honoring cloud_processing and context_sharing
+  - shows a Preview with [Apply][Copy][Retry][Cancel]; Apply re-verifies the
+    target (stale-target check) and falls back to Copy (V2 "Preview ve Apply")
+  - clears the temporary context snapshot on exit (no persistent memory)
+
+Opens instantly -- no model or network call blocks the window (V2 invariant).
+
+CLI:
+  relay-bar              open the window (requires a display)
+  relay-bar --actions    print action ids, one per line, no display needed
+  relay-bar --version    print installed version
+"""
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _relay_actions as actions  # noqa: E402
+import _relay_context as context  # noqa: E402
+import _relay_settings as settings  # noqa: E402
+
+
+def _print_actions() -> int:
+    for aid in actions.action_ids():
+        print(aid)
+    return 0
+
+
+def _installed_version() -> str:
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "relay" / "version"
+    if cfg.exists():
+        return cfg.read_text(encoding="utf-8").strip() or "unknown"
+    return "unknown"
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Write text to the X clipboard (CLIPBOARD selection). Returns success."""
+    import subprocess  # noqa: E402
+    for tool, cmd in (("xclip", ["xclip", "-selection", "clipboard"]),
+                      ("wl-copy", ["wl-copy"])):
+        if subprocess.run(["sh", "-c", f"command -v {tool}"],
+                          capture_output=True).returncode == 0:
+            try:
+                subprocess.run(cmd, input=text.encode(), timeout=2.0)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def _trigger_paste() -> None:
+    """Run voxtype-paste-active to paste the clipboard into the active window
+    (terminal-aware Ctrl+V vs Ctrl+Shift+V)."""
+    import shutil  # noqa: E402
+    import subprocess  # noqa: E402
+    helper = shutil.which("voxtype-paste-active")
+    if not helper:
+        local = Path(__file__).with_name("voxtype-paste-active")
+        if local.exists():
+            helper = str(local)
+    if helper:
+        try:
+            subprocess.run([helper], timeout=5.0,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+def _notify(title: str, body: str) -> None:
+    import subprocess  # noqa: E402
+    try:
+        subprocess.run(
+            ["notify-send", "--app-name=relay", title, body],
+            timeout=3.0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def _apply_result(text: str, snapshot: dict) -> None:
+    """Apply an action result with the V2 stale-target contract.
+
+    match    -> paste into the target (clipboard + voxtype-paste-active)
+    changed  -> copy to clipboard + notify "source changed"
+    unknown  -> copy to clipboard + notify (target unverifiable)
+    Never force-focus the old window; never lose the result (V2).
+    """
+    _copy_to_clipboard(text)
+    verdict = context.verify_target(snapshot)
+    if verdict == "match":
+        _trigger_paste()
+        _notify("Relay", "Applied to target")
+    elif verdict == "changed":
+        _notify("Relay", "Source changed; result copied to clipboard")
+    else:
+        _notify("Relay", "Result copied to clipboard (target unverifiable)")
+
+
+def _run_action_threaded(action_id, input_text, snapshot, cfg, on_done):
+    """Run a Relay Action in a background thread; call on_done(output, error)
+    on the GTK main thread via GLib.idle_add."""
+    import threading  # noqa: E402
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib  # noqa: E402
+
+    ctx_text = context.context_text_for_model(
+        snapshot, settings.context_sharing_enabled(cfg))
+    image_b64 = context.context_image_b64(
+        snapshot, settings.context_sharing_enabled(cfg))
+
+    def _work():
+        import _voxtype_groq as groq  # noqa: E402
+        out, err = actions.run_action(
+            action_id, input_text, groq,
+            context_text=ctx_text,
+            cloud_processing=settings.cloud_processing_enabled(cfg),
+            context_sharing=settings.context_sharing_enabled(cfg),
+            image_b64=image_b64,
+        )
+        GLib.idle_add(lambda: on_done(out, err))
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+def _show_preview(action_id, output, snapshot, cfg):
+    """Preview window with the result and Apply/Copy/Retry/Cancel per kind."""
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk, GLib  # noqa: E402
+
+    spec = actions.action_spec(action_id) or {}
+    kind = (actions.action_by_id(action_id) or {}).get("kind", "transform")
+    is_transform = kind in ("transform", "custom")
+
+    win = Gtk.Window()
+    win.set_title(f"Relay · {action_id}")
+    win.set_default_size(560, 360)
+    win.set_border_width(12)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_keep_above(True)
+    win.connect("destroy", lambda *_: Gtk.main_quit())
+    win.connect("key-press-event", lambda _w, e: Gtk.main_quit()
+                if e.keyval == Gdk.KEY_Escape else None)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    win.add(outer)
+
+    sw = Gtk.ScrolledWindow()
+    sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    tv = Gtk.TextView()
+    tv.set_editable(False)
+    tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    tv.get_buffer().set_text(output)
+    sw.add(tv)
+    outer.pack_start(sw, True, True, 0)
+
+    btnbox = Gtk.Box(spacing=8)
+    outer.pack_start(btnbox, False, False, 4)
+
+    def _copy(_):
+        _copy_to_clipboard(output)
+        _notify("Relay", "Result copied to clipboard")
+        Gtk.main_quit()
+
+    def _apply(_):
+        # Hide the preview so focus returns to the target, then verify + apply.
+        win.hide()
+        GLib.timeout_add(300, lambda: (_apply_result(output, snapshot), Gtk.main_quit()))
+        return True
+
+    def _retry(_):
+        win.destroy()
+        # Re-open the bar so the user can pick a different action/input.
+        # The snapshot is still valid (same session); just restart the loop.
+        _build_bar_window(snapshot, cfg)
+
+    if is_transform:
+        b = Gtk.Button(label="Apply")
+        b.connect("clicked", _apply)
+        btnbox.pack_start(b, False, False, 0)
+    b = Gtk.Button(label="Copy")
+    b.connect("clicked", _copy)
+    btnbox.pack_start(b, False, False, 0)
+    b = Gtk.Button(label="Retry")
+    b.connect("clicked", _retry)
+    btnbox.pack_start(b, False, False, 0)
+    b = Gtk.Button(label="Cancel")
+    b.connect("clicked", lambda *_: Gtk.main_quit())
+    btnbox.pack_start(b, False, False, 0)
+
+    win.show_all()
+
+
+def _show_settings_dialog(parent, cfg):
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk  # noqa: E402
+
+    dlg = Gtk.Dialog(title="Relay Settings", transient_for=parent, modal=True)
+    dlg.add_buttons("Close", Gtk.ResponseType.CLOSE)
+
+    box = dlg.get_content_area()
+    box.set_spacing(8)
+    box.set_border_width(12)
+
+    cloud = Gtk.CheckButton(label="Cloud processing (send text to the remote model)")
+    cloud.set_active(cfg["cloud_processing"])
+    ctx = Gtk.CheckButton(label="Context sharing (send active window/app/selection to the model)")
+    ctx.set_active(cfg["context_sharing"])
+    consent = Gtk.CheckButton(label="I have consented to context sharing")
+    consent.set_active(cfg["context_sharing_consented"])
+
+    box.pack_start(Gtk.Label(label="<b>Privacy (V2)</b>", use_markup=True), False, False, 0)
+    box.pack_start(cloud, False, False, 0)
+    box.pack_start(ctx, False, False, 0)
+    box.pack_start(consent, False, False, 0)
+    box.pack_start(Gtk.Label(
+        label="Turning context sharing off does not change cloud processing. "
+              "When cloud processing is off, remote Actions are unavailable."), False, False, 0)
+
+    def _on_close(_d):
+        new = dict(cfg)
+        new["cloud_processing"] = cloud.get_active()
+        new["context_sharing"] = ctx.get_active()
+        new["context_sharing_consented"] = consent.get_active()
+        settings.save(new)
+
+    dlg.connect("response", lambda d, _r: (_on_close(d), d.destroy()))
+    dlg.show_all()
+    return dlg
+
+
+def _consent_first_use(parent, snapshot, cfg):
+    """If context exists and consent is missing, ask once (V2 first-use)."""
+    if cfg.get("context_sharing_consented"):
+        return cfg
+    has_ctx = bool(snapshot.get("app") or snapshot.get("has_selection"))
+    if not has_ctx:
+        return cfg
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk  # noqa: E402
+
+    dlg = Gtk.MessageDialog(
+        transient_for=parent, modal=True,
+        message_type=Gtk.MessageType.QUESTION,
+        buttons=Gtk.ButtonsType.YES_NO,
+        text="Allow context sharing?",
+    )
+    dlg.format_secondary_text(
+        "Relay can send your active window's app name, title, and selected "
+        "text to the model to improve results. This is data only - never "
+        "treated as instructions. Cloud processing is separate. Allow?")
+    resp = dlg.run()
+    dlg.destroy()
+    if resp == Gtk.ResponseType.YES:
+        cfg = settings.consent_to_context_sharing()
+    else:
+        # Respect the decline: consent stays false, context sharing off.
+        cfg = dict(cfg)
+        cfg["context_sharing_consented"] = False
+        cfg["context_sharing"] = False
+        settings.save(cfg)
+    return cfg
+
+
+def _build_bar_window(snapshot, cfg):
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk  # noqa: E402
+
+    win = Gtk.Window()
+    win.set_title("Relay")
+    win.set_default_size(560, 240)
+    win.set_border_width(16)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_keep_above(True)
+    win.connect("destroy", lambda *_: Gtk.main_quit())
+    win.connect("key-press-event", lambda _w, e: Gtk.main_quit()
+                if e.keyval == Gdk.KEY_Escape else None)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    win.add(outer)
+
+    title = Gtk.Label(label="<b>Relay</b>", use_markup=True)
+    title.set_halign(Gtk.Align.START)
+    outer.pack_start(title, False, False, 0)
+
+    prompt = Gtk.Label(label="Ne yapmak istiyorsun?")
+    prompt.set_halign(Gtk.Align.START)
+    outer.pack_start(prompt, False, False, 0)
+
+    ctx_line = actions.format_context(
+        app=snapshot.get("app", ""), has_selection=snapshot.get("has_selection", False),
+        has_image=snapshot.get("has_image", False))
+    clabel = Gtk.Label(label=ctx_line)
+    clabel.set_halign(Gtk.Align.START)
+    outer.pack_start(clabel, False, False, 0)
+
+    if snapshot.get("warnings"):
+        wlbl = Gtk.Label(label="⚠ " + "; ".join(snapshot["warnings"]))
+        wlbl.set_halign(Gtk.Align.START)
+        wlbl.get_style_context().add_class("dim-label")
+        outer.pack_start(wlbl, False, False, 0)
+
+    entry = Gtk.Entry()
+    entry.set_text(snapshot.get("selection", "") if snapshot.get("has_selection") else "")
+    entry.set_placeholder_text("Write or paste text, then pick an action")
+    outer.pack_start(entry, False, False, 0)
+
+    btnbox = Gtk.Box(spacing=8)
+    outer.pack_start(btnbox, False, False, 4)
+
+    def _on_action(a):
+        def _clicked(_):
+            input_text = entry.get_text().strip() or snapshot.get("selection", "")
+            if a["id"] == "dictate":
+                import subprocess  # noqa: E402
+                try:
+                    subprocess.Popen(actions.dictation_command(),
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+                Gtk.main_quit()
+                return
+            if not input_text:
+                _notify("Relay", "No input text")
+                return
+            # Hide the bar so focus returns to the target before the action
+            # and before the preview's stale-target check.
+            win.hide()
+            _show_working_then_run(a["id"], input_text, snapshot, cfg)
+        return _clicked
+
+    for a in actions.visible_actions():
+        b = Gtk.Button(label=a["label"])
+        b.connect("clicked", _on_action(a))
+        btnbox.pack_start(b, False, False, 0)
+
+    settings_btn = Gtk.Button(label="Settings")
+    settings_btn.connect("clicked", lambda *_: _show_settings_dialog(win, cfg))
+    btnbox.pack_end(settings_btn, False, False, 0)
+
+    win.show_all()
+    return win
+
+
+def _show_working_then_run(action_id, input_text, snapshot, cfg):
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, GLib  # noqa: E402
+
+    work = Gtk.Window()
+    work.set_title("Relay")
+    work.set_default_size(260, 80)
+    work.set_position(Gtk.WindowPosition.CENTER)
+    work.set_keep_above(True)
+    work.set_decorated(False)
+    work.add(Gtk.Label(label="Processing..."))
+    work.show_all()
+
+    def _on_done(output, err):
+        work.destroy()
+        if err:
+            _notify("Relay", f"Action failed: {err}")
+            Gtk.main_quit()
+            return
+        _show_preview(action_id, output, snapshot, cfg)
+    _run_action_threaded(action_id, input_text, snapshot, cfg, _on_done)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="relay-bar", description="Relay Bar surface")
+    parser.add_argument("--actions", action="store_true",
+                        help="print action ids and exit (no display needed)")
+    parser.add_argument("--version", action="store_true",
+                        help="print installed version and exit")
+    args = parser.parse_args()
+
+    if args.version:
+        print(_installed_version())
+        return 0
+    if args.actions:
+        return _print_actions()
+
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        print("relay-bar: no display found (DISPLAY/WAYLAND_DISPLAY unset)", file=sys.stderr)
+        return 1
+
+    import atexit  # noqa: E402
+    import signal  # noqa: E402
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk  # noqa: E402
+    Gtk.init()
+
+    # Clear any stale snapshot from a previous crash/logout first, then never
+    # let the temp context persist (V2: "Gecici context kalici hafizaya
+    # donusturulmemeli"). atexit + SIGTERM both clear on the way out.
+    context.clear_snapshot()
+    atexit.register(context.clear_snapshot)
+
+    def _on_sigterm(signum, frame):
+        context.clear_snapshot()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
+
+    # Capture context BEFORE the window takes focus (V2 invariant).
+    snapshot = context.capture_snapshot()
+    context.save_snapshot(snapshot)
+    cfg = settings.load()
+
+    win = _build_bar_window(snapshot, cfg)
+    cfg = _consent_first_use(win, snapshot, cfg)
+
+    Gtk.main()
+    # Clear the temporary context snapshot on exit (V2: no persistent memory).
+    context.clear_snapshot()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
