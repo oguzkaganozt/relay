@@ -204,7 +204,7 @@ def _show_preview(action_id, output, snapshot, cfg):
     win.show_all()
 
 
-def _build_model_combo(cfg_value: str, placeholder: str, groq_cfg: dict) -> Gtk.ComboBoxText:
+def _build_model_combo(cfg_value: str, placeholder: str, groq_cfg: dict):
     """Return a ComboBoxText with [Auto / Recommended] + fetched Groq models."""
     import gi  # noqa: E402
     gi.require_version("Gtk", "3.0")
@@ -232,7 +232,7 @@ def _build_model_combo(cfg_value: str, placeholder: str, groq_cfg: dict) -> Gtk.
     return combo
 
 
-def _model_value(combo: Gtk.ComboBoxText) -> str:
+def _model_value(combo) -> str:
     """Return the active text (user-typed or selected) stripped."""
     child = combo.get_child()
     return child.get_text().strip() if child else ""
