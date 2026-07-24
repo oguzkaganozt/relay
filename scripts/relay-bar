@@ -11,12 +11,18 @@ A transient GTK3 window opened by the Ctrl+Alt+Space global shortcut. It:
     target (stale-target check) and falls back to Copy (V2 "Preview ve Apply")
   - clears the temporary context snapshot on exit (no persistent memory)
 
+Direct hotkeys share the same runner:
+  relay-bar --action rewrite
+  relay-bar --action summarize
+
 Opens instantly -- no model or network call blocks the window (V2 invariant).
 
 CLI:
   relay-bar              open the window (requires a display)
+  relay-bar --action ID  run one action on the current selection (preview)
   relay-bar --actions    print action ids, one per line, no display needed
   relay-bar --version    print installed version
+  relay-bar --settings   open settings dialog
 """
 import argparse
 import os
@@ -40,6 +46,41 @@ def _installed_version() -> str:
     if cfg.exists():
         return cfg.read_text(encoding="utf-8").strip() or "unknown"
     return "unknown"
+
+
+_BAR_CSS = b"""
+#relay-bar .relay-prompt { font-size: 15px; font-weight: 600; }
+#relay-bar .relay-context { font-size: 11px; }
+#relay-bar .relay-hint { font-size: 10px; }
+#relay-bar entry { padding: 8px 10px; font-size: 14px; border-radius: 8px; }
+#relay-bar button { padding: 6px 14px; font-size: 13px; border-radius: 8px; }
+#relay-bar .relay-settings-btn { padding: 6px 8px; }
+#relay-preview textview { font-size: 13px; }
+"""
+
+
+def _install_css() -> None:
+    """Theme-agnostic polish: spacing, radius, font sizes only. Colors come
+    from the system theme (dim-label / suggested-action classes)."""
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk  # noqa: E402
+    provider = Gtk.CssProvider()
+    provider.load_from_data(_BAR_CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def _pretty_app(app: str) -> str:
+    """Friendly app name from WM_CLASS tokens
+    ("ghostty com.mitchellh.ghostty" -> "Ghostty")."""
+    toks = [t for t in (app or "").split() if t]
+    if not toks:
+        return "Unknown app"
+    plain = [t for t in toks if "." not in t]
+    pick = plain[0] if plain else toks[-1].rsplit(".", 1)[-1]
+    return pick[:1].upper() + pick[1:]
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -105,7 +146,8 @@ def _apply_result(text: str, snapshot: dict) -> None:
         _notify("Relay", "Result copied to clipboard (target unverifiable)")
 
 
-def _run_action_threaded(action_id, input_text, snapshot, cfg, on_done):
+def _run_action_threaded(action_id, input_text, snapshot, cfg, on_done,
+                         instruction=""):
     """Run a Relay Action in a background thread; call on_done(output, error)
     on the GTK main thread via GLib.idle_add."""
     import threading  # noqa: E402
@@ -128,28 +170,32 @@ def _run_action_threaded(action_id, input_text, snapshot, cfg, on_done):
             image_b64=image_b64,
             text_model=settings.text_model(cfg),
             vision_model=settings.vision_model(cfg),
+            instruction=instruction,
         )
         GLib.idle_add(lambda: on_done(out, err))
 
     threading.Thread(target=_work, daemon=True).start()
 
 
-def _show_preview(action_id, output, snapshot, cfg):
+def _show_preview(action_id, output, snapshot, cfg, input_text="",
+                  instruction=""):
     """Preview window with the result and Apply/Copy/Retry/Cancel per kind."""
     import gi  # noqa: E402
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
-    spec = actions.action_spec(action_id) or {}
     kind = (actions.action_by_id(action_id) or {}).get("kind", "transform")
+    label = (actions.action_by_id(action_id) or {}).get("label", action_id)
     is_transform = kind in ("transform", "custom")
 
     win = Gtk.Window()
-    win.set_title(f"Relay · {action_id}")
-    win.set_default_size(560, 360)
+    win.set_name("relay-preview")
+    win.set_title(f"Relay · {label}")
+    win.set_default_size(620, 400)
     win.set_border_width(12)
     win.set_position(Gtk.WindowPosition.CENTER)
     win.set_keep_above(True)
+    win.set_skip_taskbar_hint(True)
     destroy_handler = win.connect("destroy", lambda *_: Gtk.main_quit())
     win.connect("key-press-event", lambda _w, e: Gtk.main_quit()
                 if e.keyval == Gdk.KEY_Escape else None)
@@ -162,6 +208,10 @@ def _show_preview(action_id, output, snapshot, cfg):
     tv = Gtk.TextView()
     tv.set_editable(False)
     tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    tv.set_margin_start(8)
+    tv.set_margin_end(8)
+    tv.set_margin_top(8)
+    tv.set_margin_bottom(8)
     tv.get_buffer().set_text(output)
     sw.add(tv)
     outer.pack_start(sw, True, True, 0)
@@ -183,12 +233,15 @@ def _show_preview(action_id, output, snapshot, cfg):
     def _retry(_):
         win.disconnect(destroy_handler)
         win.destroy()
-        # Re-open the bar so the user can pick a different action/input.
-        # The snapshot is still valid (same session); just restart the loop.
-        _build_bar_window(snapshot, cfg)
+        if input_text:
+            _show_working_then_run(action_id, input_text, snapshot, cfg,
+                                   instruction=instruction)
+        else:
+            _build_bar_window(snapshot, cfg)
 
     if is_transform:
         b = Gtk.Button(label="Apply")
+        b.get_style_context().add_class("suggested-action")
         b.connect("clicked", _apply)
         btnbox.pack_start(b, False, False, 0)
     b = Gtk.Button(label="Copy")
@@ -365,17 +418,72 @@ def _consent_first_use(parent, snapshot, cfg):
     return cfg
 
 
+def _prompt_instruction(parent, initial="") -> str | None:
+    """Ask for a Custom Action instruction. Returns None if cancelled."""
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk  # noqa: E402
+
+    dlg = Gtk.Dialog(title="Custom Action", transient_for=parent, modal=True)
+    dlg.set_default_size(480, -1)
+    dlg.add_buttons(
+        "Cancel", Gtk.ResponseType.CANCEL,
+        "Run", Gtk.ResponseType.OK,
+    )
+    dlg.set_default_response(Gtk.ResponseType.OK)
+    run_btn = dlg.get_widget_for_response(Gtk.ResponseType.OK)
+    if run_btn:
+        run_btn.get_style_context().add_class("suggested-action")
+
+    box = dlg.get_content_area()
+    box.set_spacing(8)
+    box.set_border_width(12)
+    box.pack_start(Gtk.Label(
+        label="What should I do with this text?",
+        halign=Gtk.Align.START,
+    ), False, False, 0)
+
+    entry = Gtk.Entry()
+    entry.set_text(initial)
+    entry.set_placeholder_text("e.g. Make it a polite email, convert to bullets…")
+    entry.set_activates_default(True)
+    box.pack_start(entry, False, False, 0)
+
+    dlg.connect("key-press-event", lambda _w, e: dlg.response(Gtk.ResponseType.CANCEL)
+                if e.keyval == Gdk.KEY_Escape else None)
+    dlg.show_all()
+    entry.grab_focus()
+    resp = dlg.run()
+    text = entry.get_text().strip()
+    dlg.destroy()
+    if resp != Gtk.ResponseType.OK:
+        return None
+    return text
+
+
+_MNEMONICS = {
+    "dictate": "_Dictate",
+    "rewrite": "_Rewrite",
+    "summarize": "_Summarize",
+    "custom": "_Custom Action",
+}
+
+
 def _build_bar_window(snapshot, cfg):
     import gi  # noqa: E402
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk, Gdk  # noqa: E402
 
     win = Gtk.Window()
+    win.set_name("relay-bar")
     win.set_title("Relay")
-    win.set_default_size(560, 240)
+    win.set_default_size(600, -1)
+    win.set_resizable(False)
     win.set_border_width(16)
     win.set_position(Gtk.WindowPosition.CENTER)
     win.set_keep_above(True)
+    win.set_skip_taskbar_hint(True)
+    win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
     win.connect("destroy", lambda *_: Gtk.main_quit())
     win.connect("key-press-event", lambda _w, e: Gtk.main_quit()
                 if e.keyval == Gdk.KEY_Escape else None)
@@ -383,19 +491,18 @@ def _build_bar_window(snapshot, cfg):
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     win.add(outer)
 
-    title = Gtk.Label(label="<b>Relay</b>", use_markup=True)
-    title.set_halign(Gtk.Align.START)
-    outer.pack_start(title, False, False, 0)
-
     prompt = Gtk.Label(label="Ne yapmak istiyorsun?")
     prompt.set_halign(Gtk.Align.START)
+    prompt.get_style_context().add_class("relay-prompt")
     outer.pack_start(prompt, False, False, 0)
 
-    ctx_line = actions.format_context(
-        app=snapshot.get("app", ""), has_selection=snapshot.get("has_selection", False),
-        has_image=snapshot.get("has_image", False))
+    sel_part = "Selected text" if snapshot.get("has_selection") else "No selection"
+    img_part = "Image" if snapshot.get("has_image") else "No image"
+    ctx_line = f"{_pretty_app(snapshot.get('app', ''))} · {sel_part} · {img_part}"
     clabel = Gtk.Label(label=ctx_line)
     clabel.set_halign(Gtk.Align.START)
+    clabel.get_style_context().add_class("dim-label")
+    clabel.get_style_context().add_class("relay-context")
     outer.pack_start(clabel, False, False, 0)
 
     if snapshot.get("warnings"):
@@ -412,52 +519,83 @@ def _build_bar_window(snapshot, cfg):
     btnbox = Gtk.Box(spacing=8)
     outer.pack_start(btnbox, False, False, 4)
 
+    def _start(a, instruction=""):
+        input_text = entry.get_text().strip() or snapshot.get("selection", "")
+        if a["id"] == "dictate":
+            import subprocess  # noqa: E402
+            try:
+                subprocess.Popen(actions.dictation_command(),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            Gtk.main_quit()
+            return
+        if not input_text:
+            _notify("Relay", "No input text")
+            return
+        if a["id"] == "custom" and not instruction:
+            instruction = _prompt_instruction(win) or ""
+            if not instruction:
+                return
+        # Hide the bar so focus returns to the target before the action
+        # and before the preview's stale-target check.
+        win.hide()
+        _show_working_then_run(a["id"], input_text, snapshot, cfg,
+                               instruction=instruction)
+
     def _on_action(a):
-        def _clicked(_):
-            input_text = entry.get_text().strip() or snapshot.get("selection", "")
-            if a["id"] == "dictate":
-                import subprocess  # noqa: E402
-                try:
-                    subprocess.Popen(actions.dictation_command(),
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-                Gtk.main_quit()
-                return
-            if not input_text:
-                _notify("Relay", "No input text")
-                return
-            # Hide the bar so focus returns to the target before the action
-            # and before the preview's stale-target check.
-            win.hide()
-            _show_working_then_run(a["id"], input_text, snapshot, cfg)
-        return _clicked
+        return lambda _: _start(a)
 
     for a in actions.visible_actions():
-        b = Gtk.Button(label=a["label"])
+        b = Gtk.Button.new_with_mnemonic(_MNEMONICS.get(a["id"], a["label"]))
         b.connect("clicked", _on_action(a))
         btnbox.pack_start(b, False, False, 0)
 
-    settings_btn = Gtk.Button(label="Settings")
+    settings_btn = Gtk.Button()
+    settings_btn.set_image(Gtk.Image.new_from_icon_name(
+        "emblem-system-symbolic", Gtk.IconSize.BUTTON))
+    settings_btn.set_tooltip_text("Settings")
+    settings_btn.set_relief(Gtk.ReliefStyle.NONE)
+    settings_btn.get_style_context().add_class("relay-settings-btn")
     settings_btn.connect("clicked", lambda *_: _show_settings_dialog(win, cfg))
     btnbox.pack_end(settings_btn, False, False, 0)
 
+    hint = Gtk.Label(label="Enter: Rewrite · Alt+D/R/S/C: actions · Esc: kapat")
+    hint.set_halign(Gtk.Align.START)
+    hint.get_style_context().add_class("dim-label")
+    hint.get_style_context().add_class("relay-hint")
+    outer.pack_start(hint, False, False, 0)
+
+    rewrite = actions.action_by_id("rewrite")
+    if rewrite:
+        entry.connect("activate", lambda *_: _start(rewrite))
+
     win.show_all()
+    entry.grab_focus()
+    if entry.get_text():
+        entry.select_region(0, -1)
     return win
 
 
-def _show_working_then_run(action_id, input_text, snapshot, cfg):
+def _show_working_then_run(action_id, input_text, snapshot, cfg, instruction=""):
     import gi  # noqa: E402
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk, GLib  # noqa: E402
+    from gi.repository import Gtk  # noqa: E402
 
     work = Gtk.Window()
+    work.set_name("relay-working")
     work.set_title("Relay")
-    work.set_default_size(260, 80)
     work.set_position(Gtk.WindowPosition.CENTER)
     work.set_keep_above(True)
     work.set_decorated(False)
-    work.add(Gtk.Label(label="Processing..."))
+    work.set_resizable(False)
+    box = Gtk.Box(spacing=10)
+    box.set_border_width(16)
+    spinner = Gtk.Spinner()
+    spinner.start()
+    box.pack_start(spinner, False, False, 0)
+    box.pack_start(Gtk.Label(label="Processing…"), False, False, 0)
+    work.add(box)
     work.show_all()
 
     def _on_done(output, err):
@@ -466,8 +604,10 @@ def _show_working_then_run(action_id, input_text, snapshot, cfg):
             _notify("Relay", f"Action failed: {err}")
             Gtk.main_quit()
             return
-        _show_preview(action_id, output, snapshot, cfg)
-    _run_action_threaded(action_id, input_text, snapshot, cfg, _on_done)
+        _show_preview(action_id, output, snapshot, cfg,
+                      input_text=input_text, instruction=instruction)
+    _run_action_threaded(action_id, input_text, snapshot, cfg, _on_done,
+                         instruction=instruction)
 
 
 def _open_settings_only() -> None:
@@ -476,10 +616,58 @@ def _open_settings_only() -> None:
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk  # noqa: E402
     Gtk.init()
+    _install_css()
     cfg = settings.load()
     dlg = _show_settings_dialog(None, cfg)
     dlg.connect("response", lambda *_: Gtk.main_quit())
     Gtk.main()
+
+
+def _run_direct_action(action_id: str) -> int:
+    """Hotkey path: capture context, run one action, show shared preview."""
+    if action_id not in actions.ACTION_SPECS:
+        print(f"relay-bar: unknown action {action_id!r}", file=sys.stderr)
+        return 2
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        print("relay-bar: no display found (DISPLAY/WAYLAND_DISPLAY unset)", file=sys.stderr)
+        return 1
+
+    import atexit  # noqa: E402
+    import signal  # noqa: E402
+    import gi  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk  # noqa: E402
+    Gtk.init()
+    _install_css()
+
+    context.clear_snapshot()
+    atexit.register(context.clear_snapshot)
+
+    def _on_sigterm(signum, frame):
+        context.clear_snapshot()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
+
+    snapshot = context.capture_snapshot()
+    context.save_snapshot(snapshot)
+    cfg = settings.load()
+
+    input_text = (snapshot.get("selection") or "").strip()
+    if not input_text:
+        _notify("Relay", "No input text")
+        context.clear_snapshot()
+        return 1
+
+    updated_cfg = _consent_first_use(None, snapshot, cfg)
+    if updated_cfg is not cfg:
+        cfg.clear()
+        cfg.update(updated_cfg)
+
+    _show_working_then_run(action_id, input_text, snapshot, cfg)
+    Gtk.main()
+    context.clear_snapshot()
+    return 0
 
 
 def main() -> int:
@@ -490,6 +678,8 @@ def main() -> int:
                         help="print installed version and exit")
     parser.add_argument("--settings", action="store_true",
                         help="open the settings dialog and exit")
+    parser.add_argument("--action", metavar="ID",
+                        help="run one action on the current selection (rewrite|summarize|custom)")
     args = parser.parse_args()
 
     if args.version:
@@ -500,6 +690,8 @@ def main() -> int:
     if args.settings:
         _open_settings_only()
         return 0
+    if args.action:
+        return _run_direct_action(args.action.strip())
 
     if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         print("relay-bar: no display found (DISPLAY/WAYLAND_DISPLAY unset)", file=sys.stderr)
@@ -511,6 +703,7 @@ def main() -> int:
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk  # noqa: E402
     Gtk.init()
+    _install_css()
 
     # Clear any stale snapshot from a previous crash/logout first, then never
     # let the temp context persist (V2: "Gecici context kalici hafizaya

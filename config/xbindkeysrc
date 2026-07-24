@@ -2,12 +2,12 @@
 "$HOME/.local/bin/relay-bar"
     ${RELAY_BAR_BIND}
 
-# Relay: rephrase selected text
+# Relay: rewrite selected text (shared bar runner + preview)
 # NOTE: the key bindings below are template variables resolved by install.sh.
 # $HOME is expanded by xbindkeys at runtime.
-"$HOME/.local/bin/voxtype-rephrase"
+"$HOME/.local/bin/relay-bar --action rewrite"
     ${REPHRASE_BIND}
 
-# Relay: summarize selected text
-"$HOME/.local/bin/voxtype-summarize"
+# Relay: summarize selected text (shared bar runner + preview)
+"$HOME/.local/bin/relay-bar --action summarize"
     ${SUMMARIZE_BIND}

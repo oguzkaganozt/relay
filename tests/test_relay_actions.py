@@ -1,7 +1,7 @@
 """Unit tests for the Relay action registry and context formatter (stdlib only).
 
 Locks the V2 Relay Bar contract: the action set, ids, kinds, and the
-context-line format so the bar UI and the future action runner can't drift.
+context-line format so the bar UI and the action runner can't drift.
 """
 import importlib.util
 import unittest
@@ -23,8 +23,7 @@ actions = _load()
 class ActionRegistryTests(unittest.TestCase):
     def test_ids_are_unique_and_ordered(self):
         ids = actions.action_ids()
-        self.assertEqual(ids, ["dictate", "rewrite", "shorten", "translate",
-                               "summarize", "explain", "custom"])
+        self.assertEqual(ids, ["dictate", "rewrite", "summarize", "custom"])
         self.assertEqual(len(ids), len(set(ids)))
 
     def test_every_action_has_id_label_kind(self):
@@ -51,6 +50,11 @@ class ActionRegistryTests(unittest.TestCase):
 
     def test_visible_actions_matches_all(self):
         self.assertEqual(actions.visible_actions(), actions.ACTIONS)
+
+    def test_removed_actions_gone(self):
+        for aid in ("shorten", "translate", "explain"):
+            self.assertIsNone(actions.action_by_id(aid))
+            self.assertNotIn(aid, actions.ACTION_SPECS)
 
 
 class DictationCommandTests(unittest.TestCase):
@@ -91,16 +95,15 @@ class ActionSpecTests(unittest.TestCase):
         self.assertTrue(any(w in s.lower() for w in ("not execute", "no command", "text only", "do not execute")))
         self.assertTrue("external" in s.lower() or "affect" in s.lower())
 
+    def test_custom_needs_instruction(self):
+        self.assertTrue(actions.ACTION_SPECS["custom"].get("needs_instruction"))
+
 
 class BuildMessagesTests(unittest.TestCase):
     def test_rewrite_includes_text(self):
         sys_, user = actions.build_messages("rewrite", "hello world")
         self.assertIn("hello world", user)
         self.assertIn("rewritten text", sys_.lower() or sys_)
-
-    def test_translate_uses_target_lang(self):
-        _, user = actions.build_messages("translate", "hi", target_lang="Turkish")
-        self.assertIn("Turkish", user)
 
     def test_custom_uses_instruction(self):
         _, user = actions.build_messages("custom", "hi", instruction="make it a haiku")
@@ -191,6 +194,17 @@ class RunActionTests(unittest.TestCase):
         self.assertIsNone(out)
         self.assertIn("too long", err)
 
+    def test_custom_requires_instruction(self):
+        out, err = actions.run_action("custom", "hello", _FakeGroq(), instruction="")
+        self.assertIsNone(out)
+        self.assertIn("instruction", err.lower())
+
+    def test_custom_with_instruction_succeeds(self):
+        out, err = actions.run_action(
+            "custom", "hello", _FakeGroq(output="haiku"), instruction="make it a haiku")
+        self.assertEqual(out, "haiku")
+        self.assertIsNone(err)
+
     def test_http_error_returns_error_not_raise(self):
         import urllib.error
         out, err = actions.run_action("rewrite", "hello",
@@ -217,7 +231,7 @@ class RunActionTests(unittest.TestCase):
     def test_vision_model_used_when_image_and_sharing_on(self):
         # V2 step 10: context sharing on + image -> vision model + multimodal.
         groq = _FakeGroq(output="ok")
-        actions.run_action("explain", "describe this", groq,
+        actions.run_action("summarize", "describe this", groq,
                            context_sharing=True, image_b64="ZmFrZQ==")
         self.assertTrue(groq.vision_model_called)
         self.assertIsInstance(groq.last_payload["user_content"], list)
@@ -232,14 +246,14 @@ class RunActionTests(unittest.TestCase):
     def test_image_ignored_when_context_sharing_off(self):
         # V2: context sharing off -> image never sent, even if present.
         groq = _FakeGroq(output="ok")
-        actions.run_action("explain", "hi", groq,
+        actions.run_action("summarize", "hi", groq,
                            context_sharing=False, image_b64="ZmFrZQ==")
         self.assertFalse(groq.vision_model_called)
         self.assertIsInstance(groq.last_payload["user_content"], str)
 
     def test_image_ignored_when_cloud_off(self):
         # cloud off wins: no call at all.
-        out, err = actions.run_action("explain", "hi", _FakeGroq(),
+        out, err = actions.run_action("summarize", "hi", _FakeGroq(),
                                       cloud_processing=False,
                                       context_sharing=True, image_b64="ZmFrZQ==")
         self.assertIsNone(out)
@@ -253,7 +267,7 @@ class RunActionTests(unittest.TestCase):
     def test_settings_vision_model_override_used(self):
         groq = _FakeGroq(output="ok")
         actions.run_action(
-            "explain", "hi", groq,
+            "summarize", "hi", groq,
             context_sharing=True, image_b64="ZmFrZQ==",
             vision_model="custom/vision")
         self.assertEqual(groq.last_payload["model"], "custom/vision")

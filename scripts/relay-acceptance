@@ -194,13 +194,14 @@ def check_privacy():
 def check_actions():
     print("\n== Action registry ==")
     ids = actions.action_ids()
-    expected = {"dictate", "rewrite", "shorten", "translate", "summarize", "explain", "custom"}
-    _result("all 7 actions present", "pass" if set(ids) == expected else "fail",
+    expected = {"dictate", "rewrite", "summarize", "custom"}
+    _result("core 4 actions present", "pass" if set(ids) == expected else "fail",
             ", ".join(ids))
     _result("dictate is first", "pass" if ids[0] == "dictate" else "fail")
-    for aid in ("rewrite", "shorten", "translate", "summarize", "explain", "custom"):
+    for aid in ("rewrite", "summarize", "custom"):
         spec = actions.action_spec(aid)
         _result(f"{aid} has spec", "pass" if spec else "fail")
+
     # V2: custom is text-only, no external effect
     custom_sys = actions.ACTION_SPECS["custom"]["system"]
     _result("custom action is text-only (no external effect)",
@@ -257,8 +258,11 @@ def check_shortcuts():
     if xbind.exists():
         text = xbind.read_text()
         _result("relay-bar binding present", "pass" if "relay-bar" in text else "fail")
-        _result("rephrase binding present", "pass" if "voxtype-rephrase" in text else "fail")
-        _result("summarize binding present", "pass" if "voxtype-summarize" in text else "fail")
+        _result("rewrite hotkey uses bar runner",
+                "pass" if "--action rewrite" in text else "fail")
+        _result("summarize hotkey uses bar runner",
+                "pass" if "--action summarize" in text else "fail")
+
     else:
         _result("xbindkeysrc deployed", "fail", f"{xbind} not found (run install.sh)")
 
@@ -268,7 +272,8 @@ def check_bar_binary():
     rc, out, _ = _run(["python3", str(Path(__file__).parent / "relay-bar"), "--actions"])
     ids = out.strip().split("\n") if rc == 0 else []
     _result("relay-bar --actions works headless",
-            "pass" if len(ids) == 7 else "fail", f"{len(ids)} actions")
+            "pass" if len(ids) == 4 else "fail", f"{len(ids)} actions")
+
     rc, ver, _ = _run(["python3", str(Path(__file__).parent / "relay-bar"), "--version"])
     _result("relay-bar --version works", "pass" if rc == 0 and ver else "fail", ver.strip()[:20])
 

@@ -1,5 +1,6 @@
-"""Cloud-processing gates for the legacy direct action shortcuts."""
+"""Legacy hotkey scripts are thin wrappers over relay-bar --action."""
 import importlib.util
+import os
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -21,35 +22,29 @@ rephrase = _load("voxtype-rephrase")
 summarize = _load("voxtype-summarize")
 
 
-class LegacyCloudGateTests(unittest.TestCase):
-    def test_rephrase_cloud_off_makes_no_model_or_paste_call(self):
-        with mock.patch.object(rephrase, "get_selected_text", return_value="source"), \
-             mock.patch.object(rephrase.relay_settings, "load", return_value={
-                 "cloud_processing": False}), \
-             mock.patch.object(rephrase, "rephrase") as model, \
-             mock.patch.object(rephrase, "paste_text") as paste, \
-             mock.patch.object(rephrase, "_notify_err") as notify, \
-             mock.patch.object(rephrase, "log"):
-            rc = rephrase.main()
-        self.assertEqual(rc, 1)
-        model.assert_not_called()
-        paste.assert_not_called()
-        notify.assert_called_once()
+class LegacyWrapperTests(unittest.TestCase):
+    def test_rephrase_execs_relay_bar_rewrite(self):
+        bar = str(SCRIPTS / "relay-bar")
+        with mock.patch.object(rephrase, "_relay_bar", return_value=bar), \
+             mock.patch.object(rephrase.os, "execv") as execv:
+            rephrase.main()
+        execv.assert_called_once_with(bar, [bar, "--action", "rewrite"])
 
-    def test_summarize_cloud_off_makes_no_model_or_popup_call(self):
-        with mock.patch.object(summarize, "get_selected_text", return_value="source"), \
-             mock.patch.object(summarize.relay_settings, "load", return_value={
-                 "cloud_processing": False}), \
-             mock.patch.object(summarize, "summarize") as model, \
-             mock.patch.object(summarize, "show_popup") as popup, \
-             mock.patch.object(summarize, "_notify_start"), \
-             mock.patch.object(summarize, "_notify_err") as notify, \
-             mock.patch.object(summarize, "log"):
-            rc = summarize.main()
-        self.assertEqual(rc, 1)
-        model.assert_not_called()
-        popup.assert_not_called()
-        notify.assert_called_once()
+    def test_summarize_execs_relay_bar_summarize(self):
+        bar = str(SCRIPTS / "relay-bar")
+        with mock.patch.object(summarize, "_relay_bar", return_value=bar), \
+             mock.patch.object(summarize.os, "execv") as execv:
+            summarize.main()
+        execv.assert_called_once_with(bar, [bar, "--action", "summarize"])
+
+    def test_missing_bar_returns_127(self):
+        with mock.patch.object(rephrase, "_relay_bar", return_value=None):
+            self.assertEqual(rephrase.main(), 127)
+
+    def test_relay_bar_prefers_sidecar(self):
+        path = rephrase._relay_bar()
+        self.assertEqual(path, str(SCRIPTS / "relay-bar"))
+        self.assertTrue(os.path.isfile(path))
 
 
 if __name__ == "__main__":

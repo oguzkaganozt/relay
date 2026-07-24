@@ -3,7 +3,7 @@
 Centralizes config loading, API-key resolution, model/endpoint precedence,
 the chat-completions HTTP call, reasoning_effort selection, and the Groq
 free-tier token-budget math so the three calling scripts
-(voxtype-clean-dictation, voxtype-rephrase, voxtype-summarize) can't drift.
+(voxtype-clean-dictation, relay-bar actions) can't drift.
 
 Imported by sibling scripts that prepend their own directory to sys.path.
 """

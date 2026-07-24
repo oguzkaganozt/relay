@@ -1,231 +1,24 @@
 #!/usr/bin/env python3
+"""Thin wrapper: Ctrl+Alt+R runs the shared Relay rewrite path (preview + Apply)."""
 import os
 import shutil
-import subprocess
 import sys
-import time
-import urllib.error
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _voxtype_groq as groq  # noqa: E402
-import _relay_settings as relay_settings  # noqa: E402
 
-LOG = Path("/tmp") / "voxtype-rephrase.log"
-
-
-def log(msg: str) -> None:
-    try:
-        with open(LOG, "a") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-    except Exception:
-        pass
-
-
-_cfg = groq.load_config("groq", "rephrase")
-
-MODEL = groq.resolve_model(
-    _cfg["groq"], _cfg["rephrase"], "REPHRASE",
-    user_model=relay_settings.text_model(relay_settings.load()),
-)
-ENDPOINT = groq.resolve_endpoint(_cfg["groq"], _cfg["rephrase"], "REPHRASE")
-
-DEFAULT_PROMPT = (
-    "You are an experienced editor. Produce a noticeably improved rewrite, "
-    "not a light copy-edit. Restructure awkward sentences, merge related "
-    "ideas, remove filler, repetition, hedging, and unnecessary words, and "
-    "make the text sound natural and direct. Preserve ALL key information, "
-    "data, technical terms, commands, file paths, and code names unchanged. "
-    "The output should usually be shorter and clearer, but still complete in "
-    "meaning and context. Do not return a near-identical version unless the "
-    "input is already very short, already clear, or mostly technical syntax. "
-    "PRESERVE THE ORIGINAL LANGUAGE: if the input is in Turkish, output in "
-    "Turkish; if English, output in English. "
-    "Output only the rewritten text, no explanations."
-)
-SYSTEM_PROMPT = os.environ.get("REPHRASE_STYLE") or _cfg["rephrase"].get("system_prompt", DEFAULT_PROMPT)
-
-DEFAULT_USER_PROMPT = "Rewrite this text substantially more clearly and concisely:\n\n{text}"
-USER_PROMPT = _cfg["rephrase"].get("user_prompt", DEFAULT_USER_PROMPT)
-
-
-def _retry_after_seconds(e: urllib.error.HTTPError) -> float:
-    value = e.headers.get("Retry-After", "").strip()
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        return 0.0
-
-
-def get_selected_text() -> str:
-    for sel in ["primary", "clipboard"]:
-        result = subprocess.run(
-            ["xclip", "-o", "-selection", sel],
-            capture_output=True, text=True, timeout=2.0,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            log(f"read from {sel}: {len(result.stdout.strip())} chars")
-            return result.stdout.strip()
-    log("no text found in PRIMARY or CLIPBOARD")
-    return ""
-
-
-def rephrase(text: str) -> str:
-    user = USER_PROMPT.format(text=text)
-    api_key = groq.get_api_key(_cfg["groq"])
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY is not configured")
-    payload = groq.build_payload(
-        MODEL, SYSTEM_PROMPT, user,
-        temperature=0.3,
-        max_completion_tokens=groq.token_budget(user, SYSTEM_PROMPT, ceiling=1536),
-    )
-    for attempt in range(2):
-        try:
-            output = groq.call_groq(
-                ENDPOINT, api_key, payload, timeout=5.0, user_agent="voxtype-rephrase/1.0",
-            )
-            break
-        except urllib.error.HTTPError as e:
-            retry_after = _retry_after_seconds(e)
-            if e.code == 429 and attempt == 0 and retry_after <= 6.0:
-                wait = retry_after or 1.0
-                log(f"rate limited; retrying after {wait:.1f}s")
-                time.sleep(wait)
-                continue
-            raise
-    log(f"rephrase output: {len(output)} chars")
-    return output
-
-
-def _notify(text: str) -> None:
-    MAX_LEN = 100
-    body = text[:MAX_LEN].replace("\n", " ").strip()
-    if len(text) > MAX_LEN:
-        body += "..."
-    try:
-        subprocess.run(
-            ["notify-send", "--icon=edit-paste",
-             "--app-name=relay", "D\xfczeltildi", body],
-            timeout=3.0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
-
-def _notify_err(msg: str) -> None:
-    try:
-        subprocess.run(
-            ["notify-send", "--icon=edit-paste",
-             "--app-name=relay", "Hata", msg],
-            timeout=3.0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
-
-TERMINAL_MARKERS = (
-    "terminal", "console", "ptyxis", "kgx", "konsole", "tilix",
-    "kitty", "alacritty", "wezterm", "ghostty",
-)
-
-
-def _is_terminal(wid: str) -> bool:
-    """True if the active window looks like a terminal (needs ctrl+shift+v)."""
-    if not wid:
-        return False
-    parts = []
-    for cmd in (
-        ["xdotool", "getwindowclassname", wid],
-        ["xdotool", "getwindowname", wid],
-        ["xprop", "-id", wid, "WM_CLASS"],
-    ):
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0)
-            parts.append(r.stdout)
-        except Exception:
-            pass
-    hay = " ".join(parts).lower()
-    return any(m in hay for m in TERMINAL_MARKERS)
-
-
-def paste_text(text: str) -> None:
-    subprocess.run(
-        ["xclip", "-selection", "clipboard"],
-        input=text.encode(), timeout=2.0,
-    )
-
-    paste_helper = shutil.which("voxtype-paste-active")
-    if not paste_helper:
-        local_helper = Path(__file__).with_name("voxtype-paste-active")
-        if local_helper.exists():
-            paste_helper = str(local_helper)
-
-    if paste_helper:
-        subprocess.run([paste_helper], timeout=5.0)
-        log(f"pasted {len(text)} chars via voxtype-paste-active")
-        return
-
-    wid = subprocess.run(
-        ["xdotool", "getactivewindow"],
-        capture_output=True, text=True, timeout=2.0,
-    ).stdout.strip()
-    key = "ctrl+shift+v" if _is_terminal(wid) else "ctrl+v"
-    subprocess.run(["xdotool", "key", "--clearmodifiers", key], timeout=5.0)
-    log(f"pasted {len(text)} chars via fallback {key}")
-
-
-
+def _relay_bar() -> str | None:
+    local = Path(__file__).resolve().with_name("relay-bar")
+    if local.exists():
+        return str(local)
+    return shutil.which("relay-bar")
 
 
 def main() -> int:
-    log("=== start ===")
-
-    text = get_selected_text()
-    if not text:
-        _notify_err("Metin bulunamad\u0131")
-        return 1
-
-    if len(text) > 20000:
-        _notify_err(f"Metin \xe7ok uzun ({len(text)} karakter, max 20000)")
-        return 1
-
-    if not relay_settings.cloud_processing_enabled(relay_settings.load()):
-        _notify_err("Cloud processing kapali; Rewrite kullanilamiyor")
-        return 1
-
-    try:
-        output = rephrase(text)
-    except urllib.error.HTTPError as e:
-        log(f"HTTP error: {e.code} {e.reason}")
-        if e.code == 413:
-            _notify_err(f"Metin \xe7ok uzun ({len(text)} karakter)")
-        elif e.code == 429:
-            retry_after = _retry_after_seconds(e)
-            if retry_after:
-                _notify_err(f"Groq limit dolu, {retry_after:.0f} sn sonra tekrar dene")
-            else:
-                _notify_err("Groq limit dolu, birazdan tekrar dene")
-        else:
-            _notify_err(f"HTTP {e.code}")
-        paste_text(text)
-        return 1
-    except Exception as e:
-        log(f"API error: {e}")
-        _notify_err(f"API: {type(e).__name__}")
-        paste_text(text)
-        return 1
-
-    if not output:
-        log("empty response")
-        _notify_err("Groq yan\u0131t vermedi")
-        paste_text(text)
-        return 1
-
-    paste_text(output)
-    _notify(output)
-    log("=== done ===")
-    return 0
+    bar = _relay_bar()
+    if not bar:
+        print("voxtype-rephrase: relay-bar not found", file=sys.stderr)
+        return 127
+    os.execv(bar, [bar, "--action", "rewrite"])
 
 
 if __name__ == "__main__":
